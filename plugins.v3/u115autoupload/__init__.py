@@ -51,6 +51,7 @@ def _get_115_api():
     if not all(hasattr(api, name) for name in ("_request_api", "get_item", "get_folder", "upload")):
         logger.error("115 适配器接口已变化，插件需要适配当前 MoviePilot 版本")
         return None
+    logger.debug("【115自动上传】已取得宿主 115 适配器实例")
     return api
 
 
@@ -62,8 +63,11 @@ def probe_rapid_upload_once(
     *,
     file_sha1: Optional[str] = None,
     file_preid: Optional[str] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[FileItem]:
     """只执行一次 115 秒传探测，不触发普通上传。"""
+    if diagnostics is None:
+        diagnostics = {}
     if not target_dir.fileid:
         raise ValueError("115 目标目录缺少 fileid")
 
@@ -85,8 +89,19 @@ def probe_rapid_upload_once(
     init_resp = api._request_api(
         "POST", "/open/upload/init", data=init_data, retry_limit=0
     )
-    if not isinstance(init_resp, dict) or not init_resp.get("state"):
-        logger.debug(f"【115秒传】初始化失败：{init_resp}")
+    if not isinstance(init_resp, dict):
+        diagnostics.update(reason="init_failed", code=None)
+        logger.debug("【115秒传】初始化请求失败：响应不是字典")
+        return None
+    if not init_resp.get("state"):
+        diagnostics.update(
+            reason="init_failed",
+            code=init_resp.get("code"),
+        )
+        logger.debug(
+            f"【115秒传】初始化失败：state={init_resp.get('state')} "
+            f"code={init_resp.get('code')} message={init_resp.get('message')}"
+        )
         return None
     init_result = init_resp.get("data") or {}
 
@@ -107,17 +122,33 @@ def probe_rapid_upload_once(
         init_resp = api._request_api(
             "POST", "/open/upload/init", data=init_data, retry_limit=0
         )
-        if not isinstance(init_resp, dict) or not init_resp.get("state"):
-            logger.debug(f"【115秒传】二次认证失败：{init_resp}")
+        if not isinstance(init_resp, dict):
+            diagnostics.update(reason="sign_failed", code=None)
+            logger.debug("【115秒传】二次认证请求失败：响应不是字典")
+            return None
+        if not init_resp.get("state"):
+            diagnostics.update(
+                reason="sign_failed",
+                code=init_resp.get("code"),
+            )
+            logger.debug(
+                f"【115秒传】二次认证失败：state={init_resp.get('state')} "
+                f"code={init_resp.get('code')} message={init_resp.get('message')}"
+            )
             return None
         init_result = init_resp.get("data") or {}
 
+    diagnostics.update(
+        code=init_result.get("code"),
+        status=init_result.get("status"),
+    )
     logger.debug(
         f"【115秒传】code={init_result.get('code')} "
         f"status={init_result.get('status')} "
         f"sign_check={bool(init_result.get('sign_check'))}"
     )
     if init_result.get("status") != 2:
+        diagnostics["reason"] = "not_rapid"
         return None
 
     file_id = init_result.get("file_id")
@@ -130,6 +161,10 @@ def probe_rapid_upload_once(
             retry_limit=0,
         )
         if isinstance(info_resp, dict):
+            diagnostics.update(
+                reason="hit",
+                fileid=str(info_resp.get("file_id") or ""),
+            )
             is_file = info_resp.get("file_category") == "1"
             return FileItem(
                 storage=U115_STORAGE,
@@ -147,8 +182,10 @@ def probe_rapid_upload_once(
     for _ in range(3):
         item = api.get_item(target_path)
         if item:
+            diagnostics["reason"] = "hit"
             return item
         time.sleep(1)
+    diagnostics["reason"] = "index_timeout"
     return None
 
 
@@ -178,8 +215,21 @@ def rapid_upload_with_retry(
     ):
         file_sha1 = cached["sha1"]
         file_preid = cached["preid"]
+        logger.debug(f"【115秒传】复用 SHA1 缓存：{local_path}")
     else:
+        hash_started = time.monotonic()
+        logger.debug(f"【115秒传】开始计算 SHA1：{local_path}")
         file_sha1, file_preid = _sha1_pair(local_path)
+        hash_elapsed = time.monotonic() - hash_started
+        if hash_elapsed >= 5:
+            logger.info(
+                f"【115秒传】SHA1 计算完成：{local_path} "
+                f"({stat.st_size} 字节)，耗时 {hash_elapsed:.1f}s"
+            )
+        else:
+            logger.debug(
+                f"【115秒传】SHA1 计算完成：{local_path}，耗时 {hash_elapsed:.1f}s"
+            )
         if hash_cache is not None:
             if len(hash_cache) >= 1000:
                 hash_cache.pop(next(iter(hash_cache)), None)
@@ -191,6 +241,7 @@ def rapid_upload_with_retry(
             }
 
     for attempt in range(1, retry_times + 1):
+        diagnostics: Dict[str, Any] = {}
         item = probe_rapid_upload_once(
             api,
             target_dir,
@@ -198,21 +249,33 @@ def rapid_upload_with_retry(
             new_name,
             file_sha1=file_sha1,
             file_preid=file_preid,
+            diagnostics=diagnostics,
         )
         if item:
-            logger.info(f"【115秒传】第 {attempt} 次探测命中：{item.path}")
+            logger.info(
+                f"【115秒传】第 {attempt}/{retry_times} 次探测命中：{item.path}"
+            )
             return item
+
+        logger.info(
+            f"【115秒传】第 {attempt}/{retry_times} 次未命中："
+            f"reason={diagnostics.get('reason', 'unknown')} "
+            f"code={diagnostics.get('code')} "
+            f"status={diagnostics.get('status')}"
+        )
         # 这里的 sleep 在本次探测失败返回之后才执行，
         # 计时起点是失败时刻，不是探测发起时刻。
         if attempt < retry_times:
-            logger.info(
-                f"【115秒传】第 {attempt}/{retry_times} 次未命中，"
-                f"{retry_interval:g}s 后重试"
-            )
+            logger.info(f"【115秒传】等待 {retry_interval:g}s 后重试")
             time.sleep(retry_interval)
 
-    logger.info("【115秒传】探测次数已用尽，回退到宿主 upload()")
-    return api.upload(target_dir, local_path, new_name)
+    logger.info("【115秒传】探测次数已用尽，回退到宿主普通上传")
+    uploaded = api.upload(target_dir, local_path, new_name)
+    if uploaded:
+        logger.info(f"【115秒传】宿主普通上传返回：{uploaded.path}")
+    else:
+        logger.error("【115秒传】宿主普通上传失败")
+    return uploaded
 
 
 class U115AutoUpload(_PluginBase):
@@ -220,7 +283,7 @@ class U115AutoUpload(_PluginBase):
 
     plugin_name = "115 目录秒传上传"
     plugin_desc = "监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "u115autoupload_"
@@ -279,6 +342,22 @@ class U115AutoUpload(_PluginBase):
         self._extension_set = self.__parse_extensions(config.get("extensions"))
         self._scan_state = {}
         self._last_scan = ""
+
+        if self._enabled:
+            logger.info(
+                f"【115自动上传】插件已启用 v{self.plugin_version}："
+                f"监控目录={self._watch_dir or '未设置'}，"
+                f"目标目录={self._target_dir or '未设置'}，"
+                f"扫描间隔={self._scan_interval}s，"
+                f"秒传探测={self._rapid_retry}次/间隔{self._rapid_interval:g}s，"
+                f"稳定时间={self._stable_seconds}s，"
+                f"递归={self._recursive}，删除本地={self._delete_after_upload}，"
+                f"上传已有={self._upload_existing}"
+            )
+            if not self._watch_dir or not self._target_dir:
+                logger.warn("【115自动上传】已启用，但监控目录或 115 目标目录未设置")
+        else:
+            logger.info("【115自动上传】插件未启用")
 
     def get_state(self) -> bool:
         """
@@ -588,6 +667,7 @@ class U115AutoUpload(_PluginBase):
         """
         if not self._enabled:
             return {"success": False, "message": "插件未启用"}
+        logger.info("【115自动上传】手动触发扫描")
         threading.Thread(target=self.scan_once, daemon=True).start()
         return {"success": True, "message": "扫描已触发"}
 
@@ -602,8 +682,8 @@ class U115AutoUpload(_PluginBase):
             return
         try:
             self.__scan()
-        except Exception as err:
-            logger.error(f"【115自动上传】扫描失败：{err}")
+        except Exception:
+            logger.exception("【115自动上传】扫描异常")
         finally:
             self._scan_lock.release()
 
@@ -623,10 +703,19 @@ class U115AutoUpload(_PluginBase):
         if not conf or not conf.config:
             logger.error("【115自动上传】主程序未配置 115，请先在 设置 -> 存储 中登录")
             return
+        logger.debug("【115自动上传】已读取主程序 115 存储配置")
 
         api = _get_115_api()
         if api is None:
             return
+
+        started = time.monotonic()
+        candidate_count = 0
+        new_count = 0
+        success_count = 0
+        fail_count = 0
+        skip_count = 0
+        logger.info(f"【115自动上传】开始扫描：{watch_dir} -> {self._target_dir}")
 
         self._last_scan = time.strftime("%Y-%m-%d %H:%M:%S")
         processed = self.get_data("processed")
@@ -665,16 +754,24 @@ class U115AutoUpload(_PluginBase):
                 },
             )
             if not self._upload_existing:
-                logger.info("【115自动上传】首次扫描已记录现有文件，不执行上传")
+                logger.info(
+                    f"【115自动上传】首次扫描已记录现有文件 {len(processed)} 个，不执行上传"
+                )
                 return
+            logger.info("【115自动上传】首次扫描将处理目录中已有文件")
 
         for local_path in self.__iter_files(watch_dir):
+            candidate_count += 1
             if not self.__is_ready(local_path):
+                skip_count += 1
+                logger.debug(f"【115自动上传】跳过未稳定文件：{local_path}")
                 continue
             key = local_path.relative_to(watch_dir).as_posix()
             try:
                 stat = local_path.stat()
             except OSError:
+                skip_count += 1
+                logger.debug(f"【115自动上传】跳过无法读取的文件：{local_path}")
                 continue
             record = processed.get(key)
             if (
@@ -682,13 +779,21 @@ class U115AutoUpload(_PluginBase):
                 and record.get("size") == stat.st_size
                 and record.get("mtime") == int(stat.st_mtime)
             ):
+                skip_count += 1
+                logger.debug(f"【115自动上传】跳过已上传文件：{local_path}")
                 continue
 
+            new_count += 1
+            file_started = time.monotonic()
+            logger.info(
+                f"【115自动上传】发现新文件：{local_path}（{stat.st_size} 字节）"
+            )
             remote_dir = self.__remote_dir(watch_dir, local_path)
             try:
                 target_item = self.__resolve_folder(api, remote_dir)
                 if target_item is None:
                     logger.error(f"【115自动上传】无法获取/创建 115 目录：{remote_dir}")
+                    fail_count += 1
                     continue
                 uploaded = rapid_upload_with_retry(
                     api,
@@ -699,12 +804,14 @@ class U115AutoUpload(_PluginBase):
                     retry_interval=self._rapid_interval,
                     hash_cache=self._hash_cache,
                 )
-            except Exception as err:
-                logger.error(f"【115自动上传】上传 {local_path} 失败：{err}")
+            except Exception:
+                logger.exception(f"【115自动上传】上传 {local_path} 失败")
+                fail_count += 1
                 continue
 
             if not uploaded:
                 logger.error(f"【115自动上传】上传 {local_path} 失败，下轮扫描重试")
+                fail_count += 1
                 continue
 
             processed[key] = {
@@ -713,15 +820,29 @@ class U115AutoUpload(_PluginBase):
                 "uploaded_at": int(time.time()),
                 "remote_path": uploaded.path,
             }
-            self.save_data("processed", processed)
+            try:
+                self.save_data("processed", processed)
+            except Exception:
+                logger.exception("【115自动上传】保存上传记录失败")
             self._hash_cache.pop(str(local_path), None)
-            logger.info(f"【115自动上传】成功：{local_path} -> {uploaded.path}")
+            success_count += 1
+            logger.info(
+                f"【115自动上传】上传成功：{local_path} -> {uploaded.path}，"
+                f"耗时 {time.monotonic() - file_started:.1f}s"
+            )
 
             if self._delete_after_upload:
                 try:
                     local_path.unlink()
+                    logger.info(f"【115自动上传】已删除本地文件：{local_path}")
                 except Exception as err:
                     logger.warn(f"【115自动上传】删除本地文件失败：{local_path} - {err}")
+
+        logger.info(
+            f"【115自动上传】扫描完成：耗时 {time.monotonic() - started:.1f}s，"
+            f"候选 {candidate_count}，新文件 {new_count}，成功 {success_count}，"
+            f"失败 {fail_count}，跳过 {skip_count}"
+        )
 
     def __iter_files(self, watch_dir: Path):
         """
@@ -786,8 +907,12 @@ class U115AutoUpload(_PluginBase):
         """
         folder = api.get_folder(Path(remote_dir))
         if folder and folder.fileid:
+            logger.debug(
+                f"【115自动上传】目标目录：{remote_dir} -> fileid={folder.fileid}"
+            )
             return folder
         if remote_dir.strip("/") == "":
+            logger.debug("【115自动上传】目标目录使用 115 根目录")
             return FileItem(
                 storage=U115_STORAGE,
                 path="/",
