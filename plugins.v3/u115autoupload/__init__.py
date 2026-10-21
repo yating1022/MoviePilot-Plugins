@@ -7,7 +7,7 @@ import math
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -381,7 +381,7 @@ class U115AutoUpload(_PluginBase):
 
     plugin_name = "115 目录秒传上传"
     plugin_desc = "实时监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "u115autoupload_"
@@ -428,6 +428,9 @@ class U115AutoUpload(_PluginBase):
         self._hash_cache: Dict[str, Dict[str, Any]] = {}
         self._inflight: set[str] = set()
         self._progress: Dict[str, Dict[str, Any]] = {}
+        self._progress_handles: Dict[
+            str, Tuple[threading.Event, Optional[threading.Thread]]
+        ] = {}
         self._pending_events: set[str] = set()
         self._event_queue: queue.Queue[str] = queue.Queue(maxsize=10000)
         self._stop_event = threading.Event()
@@ -1130,6 +1133,15 @@ class U115AutoUpload(_PluginBase):
             thread.join(timeout=5)
             if thread.is_alive():
                 logger.warn("【115自动上传】事件处理线程未在 5 秒内退出")
+        with self._progress_lock:
+            handles = list(self._progress_handles.values())
+            self._progress_handles.clear()
+            self._progress.clear()
+        for stop_event, _ in handles:
+            stop_event.set()
+        for _, progress_thread in handles:
+            if progress_thread and progress_thread.is_alive():
+                progress_thread.join(timeout=2)
         try:
             remove_plugin_once_job(self.__class__.__name__, ONCE_JOB_ID)
         except Exception:
@@ -1272,6 +1284,21 @@ class U115AutoUpload(_PluginBase):
                 skip_count += 1
                 logger.debug(f"【115自动上传】跳过已处理文件：{local_path}")
                 continue
+            if record and record["status"] == "uploading":
+                age = time.time() - float(record.get("updated_at") or 0)
+                if age < 600:
+                    skip_count += 1
+                    logger.info(
+                        f"【115自动上传】记录仍在上传中（{age:.0f}s 前心跳），"
+                        f"跳过本轮扫描：{local_path}"
+                    )
+                    continue
+            if self.__host_upload_active(local_path):
+                skip_count += 1
+                logger.info(
+                    f"【115自动上传】宿主已有上传在进行，跳过本轮扫描：{local_path}"
+                )
+                continue
             if self.__is_pending(str(local_path)):
                 skip_count += 1
                 logger.info(
@@ -1320,6 +1347,19 @@ class U115AutoUpload(_PluginBase):
                 and record["mtime"] == int(stat.st_mtime)
             ):
                 logger.debug(f"【115自动上传】已处理且未变化，跳过：{local_path}")
+                return "skipped"
+            if record and record["status"] == "uploading":
+                age = time.time() - float(record.get("updated_at") or 0)
+                if age < 600:
+                    logger.info(
+                        f"【115自动上传】记录仍在上传中（{age:.0f}s 前心跳），"
+                        f"跳过：{local_path}"
+                    )
+                    return "skipped"
+            if self.__host_upload_active(local_path):
+                logger.info(
+                    f"【115自动上传】宿主已有上传在进行，跳过：{local_path}"
+                )
                 return "skipped"
             if record:
                 if record["status"] == "success":
@@ -1487,6 +1527,8 @@ class U115AutoUpload(_PluginBase):
             self._progress[key] = state
         stop_event = threading.Event()
         thread: Optional[threading.Thread] = None
+        with self._progress_lock:
+            self._progress_handles[key] = (stop_event, None)
         try:
             thread = threading.Thread(
                 target=self.__progress_loop,
@@ -1495,6 +1537,8 @@ class U115AutoUpload(_PluginBase):
                 daemon=True,
             )
             thread.start()
+            with self._progress_lock:
+                self._progress_handles[key] = (stop_event, thread)
         except Exception:
             logger.exception("【115自动上传】启动进度线程失败")
         return state, stop_event, thread
@@ -1565,25 +1609,27 @@ class U115AutoUpload(_PluginBase):
                     current["speed"] = average_speed
                     current["updated"] = now
 
-            if phase == "uploading" and now - last_log >= self._progress_log_interval:
-                if percent <= 0:
-                    if progress_helper is None:
-                        logger.info(
-                            f"【115自动上传】普通上传进行中：宿主进度不可用，"
-                            f"已耗时 {elapsed:.0f}s"
-                        )
+            if now - last_log >= self._progress_log_interval:
+                self.__touch_upload_record(key)
+                if phase == "uploading":
+                    if percent <= 0:
+                        if progress_helper is None:
+                            logger.info(
+                                f"【115自动上传】普通上传进行中：宿主进度不可用，"
+                                f"已耗时 {elapsed:.0f}s"
+                            )
+                        else:
+                            logger.info(
+                                f"【115自动上传】普通上传进行中：等待首个分片完成，"
+                                f"已耗时 {elapsed:.0f}s"
+                            )
                     else:
                         logger.info(
-                            f"【115自动上传】普通上传进行中：等待首个分片完成，"
+                            f"【115自动上传】普通上传进度：{percent:.1f}%"
+                            f"（{_format_size(uploaded)}/{_format_size(size)}），"
+                            f"平均速度 {_format_size(int(average_speed))}/s，"
                             f"已耗时 {elapsed:.0f}s"
                         )
-                else:
-                    logger.info(
-                        f"【115自动上传】普通上传进度：{percent:.1f}%"
-                        f"（{_format_size(uploaded)}/{_format_size(size)}），"
-                        f"平均速度 {_format_size(int(average_speed))}/s，"
-                        f"已耗时 {elapsed:.0f}s"
-                    )
                 last_log = now
 
     def __end_progress(
@@ -1598,6 +1644,7 @@ class U115AutoUpload(_PluginBase):
         if thread is not None and thread.is_alive():
             thread.join(timeout=3)
         with self._progress_lock:
+            self._progress_handles.pop(key, None)
             state = self._progress.pop(key, None)
         if state:
             logger.debug(
@@ -1619,13 +1666,45 @@ class U115AutoUpload(_PluginBase):
         )
         return snapshot
 
+    @staticmethod
+    def __host_upload_active(local_path: Path) -> bool:
+        """检查宿主进度缓存里是否已有该文件的普通上传在进行。"""
+        try:
+            from app.foundation.crypto import HashUtils
+            from app.runtime.progress import ProgressHelper
+
+            snapshot = ProgressHelper(HashUtils.md5(local_path.as_posix())).get()
+            return bool(snapshot and snapshot.get("enable"))
+        except Exception:
+            return False
+
+    def __touch_upload_record(self, local_path: str) -> None:
+        """更新上传中记录的心跳时间，避免插件重载时被误判为中断。"""
+        try:
+            with self.get_database().session() as session:
+                session.execute(
+                    update(U115UploadRecord)
+                    .where(
+                        U115UploadRecord.local_path == local_path,
+                        U115UploadRecord.status == "uploading",
+                    )
+                    .values(updated_at=datetime.now())
+                )
+                session.commit()
+        except Exception:
+            logger.debug("【115自动上传】更新上传心跳失败", exc_info=True)
+
     def __mark_stale_uploads(self) -> None:
-        """把插件重启前遗留的 uploading 记录标记为失败。"""
+        """把插件重启前遗留且长时间没有心跳的 uploading 记录标记为失败。"""
+        cutoff = datetime.now() - timedelta(minutes=10)
         try:
             with self.get_database().session() as session:
                 result = session.execute(
                     update(U115UploadRecord)
-                    .where(U115UploadRecord.status == "uploading")
+                    .where(
+                        U115UploadRecord.status == "uploading",
+                        U115UploadRecord.updated_at < cutoff,
+                    )
                     .values(status="failed", error="上次上传中断")
                 )
                 session.commit()
@@ -2105,6 +2184,9 @@ class U115AutoUpload(_PluginBase):
                     "mtime": record.mtime,
                     "remote_path": record.remote_path,
                     "retry_count": record.retry_count,
+                    "updated_at": record.updated_at.timestamp()
+                    if record.updated_at
+                    else 0.0,
                 }
         except Exception:
             logger.exception("【115自动上传】读取上传记录失败")
@@ -2206,6 +2288,12 @@ class U115AutoUpload(_PluginBase):
                     Path(local_path).relative_to(Path(self._watch_dir))
                 except ValueError:
                     return False, "文件不在当前监控目录", local_path
+                if (
+                    record.status == "uploading"
+                    and record.updated_at
+                    and (datetime.now() - record.updated_at).total_seconds() < 600
+                ):
+                    return False, "文件正在上传中", local_path
                 record.status = "pending"
                 record.error = ""
                 record.updated_at = datetime.now()
