@@ -381,7 +381,7 @@ class U115AutoUpload(_PluginBase):
 
     plugin_name = "115 目录秒传上传"
     plugin_desc = "实时监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "u115autoupload_"
@@ -411,7 +411,6 @@ class U115AutoUpload(_PluginBase):
     _watchdog_enabled = True
     _onlyonce = False
     _notify = True
-    _notify_type = "organize"
     _page = 1
     _page_size = 10
     _progress_log_interval = 60.0
@@ -461,10 +460,6 @@ class U115AutoUpload(_PluginBase):
         self._watchdog_enabled = bool(config.get("watchdog", True))
         self._onlyonce = bool(config.get("onlyonce"))
         self._notify = bool(config.get("notify", True))
-        notify_type = str(config.get("notify_type") or "organize").strip().lower()
-        self._notify_type = (
-            notify_type if notify_type in {"organize", "plugin"} else "organize"
-        )
         self._extension_set = self.__parse_extensions(config.get("extensions"))
         self._scan_state = {}
         self._last_scan = ""
@@ -696,30 +691,7 @@ class U115AutoUpload(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "notify",
-                                            "label": "上传结果发送通知",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "model": "notify_type",
-                                            "label": "通知消息类型",
-                                            "items": [
-                                                {
-                                                    "title": "整理入库（推荐）",
-                                                    "value": "organize",
-                                                },
-                                                {
-                                                    "title": "插件",
-                                                    "value": "plugin",
-                                                },
-                                            ],
+                                            "label": "上传结果发送通知（插件类型）",
                                         },
                                     }
                                 ],
@@ -836,7 +808,6 @@ class U115AutoUpload(_PluginBase):
             "onlyonce": False,
             "watchdog": True,
             "notify": True,
-            "notify_type": "organize",
             "watch_dir": "",
             "target_dir": "",
             "recursive": True,
@@ -1716,14 +1687,6 @@ class U115AutoUpload(_PluginBase):
         except Exception:
             logger.exception("【115自动上传】清理中断上传记录失败")
 
-    def __notify_mtype(self):
-        """返回当前配置对应的通知消息类型。"""
-        return (
-            MessageType.Plugin
-            if self._notify_type == "plugin"
-            else MessageType.Organize
-        )
-
     def __notify_success(
         self,
         local_path: Path,
@@ -1754,7 +1717,7 @@ class U115AutoUpload(_PluginBase):
                 f"耗时：{elapsed:.1f}s"
             )
             self.post_message(
-                mtype=self.__notify_mtype(),
+                mtype=MessageType.Plugin,
                 title="【115目录秒传上传】成功",
                 text=text,
             )
@@ -1773,7 +1736,7 @@ class U115AutoUpload(_PluginBase):
                 f"错误：{str(error)[:1000]}"
             )
             self.post_message(
-                mtype=self.__notify_mtype(),
+                mtype=MessageType.Plugin,
                 title="【115目录秒传上传】失败",
                 text=text,
             )
@@ -2027,7 +1990,6 @@ class U115AutoUpload(_PluginBase):
                 "onlyonce": False,
                 "watchdog": self._watchdog_enabled,
                 "notify": self._notify,
-                "notify_type": self._notify_type,
                 "watch_dir": self._watch_dir,
                 "target_dir": self._target_dir,
                 "recursive": self._recursive,
