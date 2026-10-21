@@ -12,11 +12,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from fastapi import Body
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text, delete, func, select
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    delete,
+    func,
+    select,
+    update,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.plugins import _PluginBase
 from app.schemas.file import FileItem
+from app.schemas.types import MessageType
 from app.sdk.database import plugin_declarative_base
 from app.sdk.logging import logger
 from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
@@ -248,11 +259,12 @@ def rapid_upload_with_retry(
     retry_times: int = 3,
     retry_interval: float = 5.0,
     hash_cache: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> Tuple[Optional[FileItem], str]:
+    progress_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[FileItem], str, int]:
     """
     先探测 retry_times 次秒传，全部未命中后再调用宿主普通上传。
 
-    :return: (上传后的文件项或 None, 方式 rapid/normal/failed)
+    :return: (上传后的文件项或 None, 方式 rapid/normal/failed, 秒传命中时的探测次数)
     """
     stat = local_path.stat()
     cache_key = str(local_path)
@@ -309,7 +321,7 @@ def rapid_upload_with_retry(
             logger.info(
                 f"【115秒传】第 {attempt}/{retry_times} 次探测命中：{item.path}"
             )
-            return item, "rapid"
+            return item, "rapid", attempt
 
         logger.info(
             f"【115秒传】第 {attempt}/{retry_times} 次未命中："
@@ -324,12 +336,15 @@ def rapid_upload_with_retry(
             time.sleep(retry_interval)
 
     logger.info("【115秒传】探测次数已用尽，回退到宿主普通上传")
+    if progress_state is not None:
+        progress_state["phase"] = "uploading"
+        progress_state["normal_started"] = time.monotonic()
     uploaded = api.upload(target_dir, local_path, new_name)
     if uploaded:
         logger.info(f"【115秒传】宿主普通上传返回：{uploaded.path}")
-        return uploaded, "normal"
+        return uploaded, "normal", 0
     logger.error("【115秒传】宿主普通上传失败")
-    return None, "failed"
+    return None, "failed", 0
 
 
 class _WatchdogHandler(FileSystemEventHandler):
@@ -366,7 +381,7 @@ class U115AutoUpload(_PluginBase):
 
     plugin_name = "115 目录秒传上传"
     plugin_desc = "实时监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
-    plugin_version = "1.1.1"
+    plugin_version = "1.2.0"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "u115autoupload_"
@@ -395,6 +410,7 @@ class U115AutoUpload(_PluginBase):
     _upload_existing = False
     _watchdog_enabled = True
     _onlyonce = False
+    _notify = True
     _page = 1
     _page_size = 10
 
@@ -405,9 +421,11 @@ class U115AutoUpload(_PluginBase):
         self._upload_lock = threading.Lock()
         self._inflight_lock = threading.Lock()
         self._event_lock = threading.Lock()
+        self._progress_lock = threading.Lock()
         self._scan_state: Dict[str, Tuple[int, float]] = {}
         self._hash_cache: Dict[str, Dict[str, Any]] = {}
         self._inflight: set[str] = set()
+        self._progress: Dict[str, Dict[str, Any]] = {}
         self._pending_events: set[str] = set()
         self._event_queue: queue.Queue[str] = queue.Queue(maxsize=10000)
         self._stop_event = threading.Event()
@@ -418,6 +436,8 @@ class U115AutoUpload(_PluginBase):
 
     def init_plugin(self, config: dict = None) -> None:
         """读取配置，初始化记录表、目录状态和实时监控。"""
+        with self._inflight_lock:
+            had_inflight = bool(self._inflight)
         self.stop_service()
         config = config or {}
         self._enabled = bool(config.get("enabled"))
@@ -435,11 +455,14 @@ class U115AutoUpload(_PluginBase):
         self._upload_existing = bool(config.get("upload_existing"))
         self._watchdog_enabled = bool(config.get("watchdog", True))
         self._onlyonce = bool(config.get("onlyonce"))
+        self._notify = bool(config.get("notify", True))
         self._extension_set = self.__parse_extensions(config.get("extensions"))
         self._scan_state = {}
         self._last_scan = ""
 
         self.__ensure_table()
+        if not had_inflight:
+            self.__mark_stale_uploads()
 
         if self._enabled:
             logger.info(
@@ -658,6 +681,24 @@ class U115AutoUpload(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "notify",
+                                            "label": "上传结果发送通知",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
@@ -762,6 +803,7 @@ class U115AutoUpload(_PluginBase):
             "enabled": False,
             "onlyonce": False,
             "watchdog": True,
+            "notify": True,
             "watch_dir": "",
             "target_dir": "",
             "recursive": True,
@@ -787,6 +829,8 @@ class U115AutoUpload(_PluginBase):
             limit=self._page_size,
             offset=(self._page - 1) * self._page_size,
         )
+        with self._event_lock:
+            queue_count = len(self._pending_events)
 
         contents: List[dict] = []
         if not self._enabled:
@@ -810,8 +854,9 @@ class U115AutoUpload(_PluginBase):
                     "class": "mb-3 flex-shrink-0",
                     "text": (
                         f"共 {total} 条记录：成功 {success}，失败 {failed}，"
-                        f"待处理 {pending}。第 {self._page}/{pages} 页，"
-                        f"每页 {self._page_size} 条。"
+                        f"待处理 {pending}，队列中 {queue_count}。"
+                        f"第 {self._page}/{pages} 页，每页 {self._page_size} 条。"
+                        "上传中的文件可点“刷新进度”查看最新进度。"
                     ),
                 },
             }
@@ -834,6 +879,12 @@ class U115AutoUpload(_PluginBase):
                 "content": [
                     self.__page_button("立即扫描", "mdi-play", "/scan"),
                     self.__page_button(
+                        "刷新进度",
+                        "mdi-refresh",
+                        "/records/page",
+                        {"page": self._page},
+                    ),
+                    self.__page_button(
                         "清理成功记录", "mdi-broom", "/records/clear_success"
                     ),
                 ],
@@ -848,13 +899,55 @@ class U115AutoUpload(_PluginBase):
                 "远端路径",
                 "方式",
                 "次数",
-                "错误",
+                "进度/错误",
                 "更新时间",
                 "操作",
             ]
             ths = [{"component": "th", "text": header} for header in headers]
             rows = []
             for record in records:
+                progress = self.__progress_snapshot(
+                    str(record.get("local_path") or "")
+                )
+                if progress:
+                    record["active"] = True
+                    record["phase"] = str(progress.get("phase") or "")
+                    record["percent"] = float(progress.get("percent") or 0)
+                    record["uploaded_bytes"] = int(
+                        progress.get("uploaded") or 0
+                    )
+                    record["speed"] = float(progress.get("speed") or 0)
+                    record["elapsed"] = float(progress.get("elapsed") or 0)
+                    record["status"] = (
+                        "probing"
+                        if record["phase"] == "probing"
+                        else "uploading"
+                    )
+
+                if record.get("active"):
+                    percent = float(record.get("percent") or 0)
+                    elapsed = float(record.get("elapsed") or 0)
+                    if record.get("phase") == "probing":
+                        progress_text = f"秒传探测中 · 已耗时 {elapsed:.0f}s"
+                    elif percent > 0:
+                        progress_text = (
+                            f"{percent:.1f}% · "
+                            f"{_format_size(int(record.get('uploaded_bytes') or 0))}/"
+                            f"{_format_size(int(record.get('file_size') or 0))} · "
+                            f"{_format_size(int(record.get('speed') or 0))}/s · "
+                            f"已耗时 {elapsed:.0f}s"
+                        )
+                    else:
+                        progress_text = f"等待分片进度 · 已耗时 {elapsed:.0f}s"
+                    progress_cell = self.__text_cell(
+                        progress_text, title=progress_text
+                    )
+                else:
+                    progress_cell = self.__text_cell(
+                        record.get("error") or "-",
+                        title=record.get("error"),
+                    )
+
                 rows.append(
                     {
                         "component": "tr",
@@ -883,10 +976,7 @@ class U115AutoUpload(_PluginBase):
                                 self.__method_text(record.get("method"))
                             ),
                             self.__text_cell(str(record.get("retry_count") or 0)),
-                            self.__text_cell(
-                                record.get("error") or "-",
-                                title=record.get("error"),
-                            ),
+                            progress_cell,
                             self.__text_cell(record.get("updated_at") or "-"),
                             {
                                 "component": "td",
@@ -1041,7 +1131,7 @@ class U115AutoUpload(_PluginBase):
             logger.warn(f"【115自动上传】重试记录 {record_id} 失败：{message}")
             return {"success": False, "message": message}
         logger.info(f"【115自动上传】重试记录 {record_id}：{local_path}")
-        self.__enqueue_event(Path(local_path))
+        self.__enqueue_event(Path(local_path), "retry")
         return {"success": True, "message": message}
 
     def api_delete_record(self, payload: dict = Body(...)) -> Dict[str, Any]:
@@ -1125,9 +1215,7 @@ class U115AutoUpload(_PluginBase):
 
         started = time.monotonic()
         candidate_count = 0
-        new_count = 0
-        success_count = 0
-        fail_count = 0
+        enqueued_count = 0
         skip_count = 0
         logger.info(f"【115自动上传】开始扫描：{watch_dir} -> {self._target_dir}")
 
@@ -1154,20 +1242,22 @@ class U115AutoUpload(_PluginBase):
                 skip_count += 1
                 logger.debug(f"【115自动上传】跳过已处理文件：{local_path}")
                 continue
+            if self.__is_pending(str(local_path)):
+                skip_count += 1
+                logger.info(
+                    f"【115自动上传】文件正在队列或上传中，跳过本轮扫描：{local_path}"
+                )
+                continue
 
-            new_count += 1
-            result = self.__process_path(local_path, watch_dir, "scan")
-            if result == "success":
-                success_count += 1
-            elif result == "failed":
-                fail_count += 1
+            if self.__enqueue_event(local_path, "scan"):
+                enqueued_count += 1
             else:
                 skip_count += 1
 
         logger.info(
             f"【115自动上传】扫描完成：耗时 {time.monotonic() - started:.1f}s，"
-            f"候选 {candidate_count}，新文件/变化 {new_count}，成功 {success_count}，"
-            f"失败 {fail_count}，跳过 {skip_count}"
+            f"候选 {candidate_count}，入队 {enqueued_count}，"
+            f"跳过 {skip_count}，队列剩余 {self._event_queue.qsize()}"
         )
 
     def __process_path(self, local_path: Path, watch_dir: Path, source: str) -> str:
@@ -1192,6 +1282,7 @@ class U115AutoUpload(_PluginBase):
                 return "skipped"
 
             record = self.__get_record(key)
+            was_failed = bool(record and record["status"] == "failed")
             if (
                 record
                 and record["status"] in {"success", "skipped"}
@@ -1230,14 +1321,37 @@ class U115AutoUpload(_PluginBase):
                     method="",
                     error="115 适配器不可用",
                 )
+                if not was_failed:
+                    self.__notify_failure(local_path, "115 适配器不可用")
                 return "failed"
+
+            self.__save_record(
+                local_path=key,
+                watch_dir=str(watch_dir),
+                relative_path=relative_path,
+                size=stat.st_size,
+                mtime=int(stat.st_mtime),
+                uploaded=None,
+                status="uploading",
+                method="",
+                error="",
+            )
+            progress_state: Optional[Dict[str, Any]] = None
+            progress_stop: Optional[threading.Event] = None
+            progress_thread: Optional[threading.Thread] = None
+            try:
+                progress_state, progress_stop, progress_thread = (
+                    self.__begin_progress(key, local_path, stat.st_size)
+                )
+            except Exception:
+                logger.exception("【115自动上传】启动上传进度跟踪失败")
 
             try:
                 with self._upload_lock:
                     target_item = self.__resolve_folder(api, remote_dir)
                     if target_item is None:
                         raise RuntimeError(f"无法获取/创建 115 目录：{remote_dir}")
-                    uploaded, method = rapid_upload_with_retry(
+                    uploaded, method, rapid_attempt = rapid_upload_with_retry(
                         api,
                         target_item,
                         local_path,
@@ -1245,9 +1359,11 @@ class U115AutoUpload(_PluginBase):
                         retry_times=self._rapid_retry,
                         retry_interval=self._rapid_interval,
                         hash_cache=self._hash_cache,
+                        progress_state=progress_state,
                     )
             except Exception as err:
                 logger.exception(f"【115自动上传】上传 {local_path} 失败")
+                self.__end_progress(key, progress_stop, progress_thread)
                 self.__save_record(
                     local_path=key,
                     watch_dir=str(watch_dir),
@@ -1259,7 +1375,10 @@ class U115AutoUpload(_PluginBase):
                     method="",
                     error=str(err),
                 )
+                if not was_failed:
+                    self.__notify_failure(local_path, str(err))
                 return "failed"
+            self.__end_progress(key, progress_stop, progress_thread)
 
             if not uploaded:
                 logger.error(f"【115自动上传】上传 {local_path} 失败，等待下次重试")
@@ -1274,8 +1393,13 @@ class U115AutoUpload(_PluginBase):
                     method="failed",
                     error="秒传和普通上传均未成功",
                 )
+                if not was_failed:
+                    self.__notify_failure(local_path, "秒传和普通上传均未成功")
                 return "failed"
 
+            stored_method = (
+                f"rapid:{rapid_attempt}" if method == "rapid" else method
+            )
             self.__save_record(
                 local_path=key,
                 watch_dir=str(watch_dir),
@@ -1284,13 +1408,22 @@ class U115AutoUpload(_PluginBase):
                 mtime=int(stat.st_mtime),
                 uploaded=uploaded,
                 status="success",
-                method=method,
+                method=stored_method,
                 error="",
             )
             self._hash_cache.pop(key, None)
+            elapsed = time.monotonic() - file_started
             logger.info(
                 f"【115自动上传】上传成功：{local_path} -> {uploaded.path}，"
-                f"方式={method}，耗时 {time.monotonic() - file_started:.1f}s"
+                f"方式={self.__method_text(stored_method)}，耗时 {elapsed:.1f}s"
+            )
+            self.__notify_success(
+                local_path,
+                uploaded,
+                stat.st_size,
+                stored_method,
+                rapid_attempt,
+                elapsed,
             )
 
             if self._delete_after_upload:
@@ -1305,6 +1438,240 @@ class U115AutoUpload(_PluginBase):
         finally:
             with self._inflight_lock:
                 self._inflight.discard(key)
+
+    def __begin_progress(
+        self, key: str, local_path: Path, size: int
+    ) -> Tuple[Dict[str, Any], threading.Event, Optional[threading.Thread]]:
+        """开始跟踪一个文件的上传进度。"""
+        state = {
+            "phase": "probing",
+            "percent": 0.0,
+            "uploaded": 0,
+            "speed": 0.0,
+            "size": size,
+            "started": time.monotonic(),
+            "normal_started": None,
+            "updated": time.monotonic(),
+        }
+        with self._progress_lock:
+            self._progress[key] = state
+        stop_event = threading.Event()
+        thread: Optional[threading.Thread] = None
+        try:
+            thread = threading.Thread(
+                target=self.__progress_loop,
+                args=(key, local_path, size, stop_event),
+                name="U115AutoUpload-progress",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            logger.exception("【115自动上传】启动进度线程失败")
+        return state, stop_event, thread
+
+    def __progress_loop(
+        self,
+        key: str,
+        local_path: Path,
+        size: int,
+        stop_event: threading.Event,
+    ) -> None:
+        """每 2 秒读取宿主分片进度并输出心跳日志。"""
+        progress_helper = None
+        try:
+            from app.foundation.crypto import HashUtils
+            from app.runtime.progress import ProgressHelper
+
+            progress_helper = ProgressHelper(HashUtils.md5(local_path.as_posix()))
+        except Exception:
+            logger.debug(
+                "【115自动上传】无法读取宿主进度缓存，仅输出耗时心跳",
+                exc_info=True,
+            )
+
+        last_log = 0.0
+        last_uploaded = 0
+        last_time = time.monotonic()
+        while not stop_event.wait(2):
+            with self._progress_lock:
+                state = self._progress.get(key)
+                if state is None:
+                    break
+                phase = str(state.get("phase") or "probing")
+                percent = float(state.get("percent") or 0)
+                uploaded = int(state.get("uploaded") or 0)
+                started = (
+                    state.get("normal_started")
+                    or state.get("started")
+                    or time.monotonic()
+                )
+
+            if progress_helper is not None:
+                try:
+                    snapshot = progress_helper.get()
+                except Exception:
+                    snapshot = None
+                if snapshot and snapshot.get("enable"):
+                    value = max(
+                        0.0, min(100.0, float(snapshot.get("value") or 0))
+                    )
+                    if value >= percent:
+                        percent = value
+                        uploaded = int(size * value / 100)
+                        with self._progress_lock:
+                            current = self._progress.get(key)
+                            if current is not None:
+                                current["phase"] = "uploading"
+                                current["percent"] = percent
+                                current["uploaded"] = uploaded
+                        phase = "uploading"
+
+            now = time.monotonic()
+            elapsed = now - started
+            delta_bytes = uploaded - last_uploaded
+            delta_time = now - last_time
+            speed = (
+                delta_bytes / delta_time
+                if delta_time > 0 and delta_bytes > 0
+                else 0.0
+            )
+            if speed > 0:
+                with self._progress_lock:
+                    current = self._progress.get(key)
+                    if current is not None:
+                        current["speed"] = speed
+                        current["updated"] = now
+
+            if phase == "uploading" and now - last_log >= 5:
+                if percent <= 0:
+                    if progress_helper is None:
+                        logger.info(
+                            f"【115自动上传】普通上传进行中：宿主进度不可用，"
+                            f"已耗时 {elapsed:.0f}s"
+                        )
+                    else:
+                        logger.info(
+                            f"【115自动上传】普通上传进行中：等待首个分片完成，"
+                            f"已耗时 {elapsed:.0f}s"
+                        )
+                else:
+                    logger.info(
+                        f"【115自动上传】普通上传进度：{percent:.1f}%"
+                        f"（{_format_size(uploaded)}/{_format_size(size)}），"
+                        f"速度 {_format_size(int(speed))}/s，"
+                        f"已耗时 {elapsed:.0f}s"
+                    )
+                last_log = now
+            last_uploaded = uploaded
+            last_time = now
+
+    def __end_progress(
+        self,
+        key: str,
+        stop_event: Optional[threading.Event],
+        thread: Optional[threading.Thread],
+    ) -> None:
+        """停止进度线程并移除内存进度。"""
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3)
+        with self._progress_lock:
+            state = self._progress.pop(key, None)
+        if state:
+            logger.debug(
+                f"【115自动上传】进度跟踪结束：{key}，"
+                f"最终 {float(state.get('percent') or 0):.1f}%"
+            )
+
+    def __progress_snapshot(self, local_path: str) -> Optional[Dict[str, Any]]:
+        """读取一个文件的实时进度快照。"""
+        with self._progress_lock:
+            state = self._progress.get(local_path)
+            if not state:
+                return None
+            snapshot = dict(state)
+        snapshot["elapsed"] = time.monotonic() - (
+            state.get("normal_started")
+            or state.get("started")
+            or time.monotonic()
+        )
+        return snapshot
+
+    def __mark_stale_uploads(self) -> None:
+        """把插件重启前遗留的 uploading 记录标记为失败。"""
+        try:
+            with self.get_database().session() as session:
+                result = session.execute(
+                    update(U115UploadRecord)
+                    .where(U115UploadRecord.status == "uploading")
+                    .values(status="failed", error="上次上传中断")
+                )
+                session.commit()
+                count = max(0, result.rowcount or 0)
+            if count:
+                logger.warn(
+                    f"【115自动上传】已将 {count} 条中断的上传记录标记为失败"
+                )
+        except Exception:
+            logger.exception("【115自动上传】清理中断上传记录失败")
+
+    def __notify_success(
+        self,
+        local_path: Path,
+        uploaded: FileItem,
+        size: int,
+        method: str,
+        rapid_attempt: int,
+        elapsed: float,
+    ) -> None:
+        """通过主程序通知发送上传成功消息。"""
+        if not self._notify:
+            return
+        try:
+            if method.startswith("rapid:"):
+                method_text = f"秒传（第 {rapid_attempt} 次探测命中）"
+            elif method == "normal":
+                method_text = (
+                    f"普通上传（{self._rapid_retry} 次秒传探测未命中）"
+                )
+            else:
+                method_text = self.__method_text(method)
+            text = (
+                f"文件：{local_path.name}\n"
+                f"本地：{local_path}\n"
+                f"远端：{uploaded.path}\n"
+                f"方式：{method_text}\n"
+                f"大小：{_format_size(size)}\n"
+                f"耗时：{elapsed:.1f}s"
+            )
+            self.post_message(
+                mtype=MessageType.Plugin,
+                title="【115目录秒传上传】成功",
+                text=text,
+            )
+            logger.info(f"【115自动上传】已发送成功通知：{local_path.name}")
+        except Exception:
+            logger.exception("【115自动上传】发送成功通知失败")
+
+    def __notify_failure(self, local_path: Path, error: Any) -> None:
+        """通过主程序通知发送首次上传失败消息。"""
+        if not self._notify:
+            return
+        try:
+            text = (
+                f"文件：{local_path.name}\n"
+                f"本地：{local_path}\n"
+                f"错误：{str(error)[:1000]}"
+            )
+            self.post_message(
+                mtype=MessageType.Plugin,
+                title="【115目录秒传上传】失败",
+                text=text,
+            )
+            logger.info(f"【115自动上传】已发送失败通知：{local_path.name}")
+        except Exception:
+            logger.exception("【115自动上传】发送失败通知失败")
 
     def __ensure_runtime(self) -> None:
         """确保事件线程和 watchdog 在需要时启动。"""
@@ -1381,9 +1748,12 @@ class U115AutoUpload(_PluginBase):
                 if not self.__wait_until_stable(path):
                     logger.info(f"【115自动上传】文件未稳定，交给定时扫描：{path}")
                     continue
+                logger.info(
+                    f"【115自动上传】开始处理队列文件（剩余 {self._event_queue.qsize()}）：{path}"
+                )
                 result = self.__process_path(path, Path(self._watch_dir), "watchdog")
                 if result != "skipped":
-                    logger.info(f"【115自动上传】实时处理结果：{path} -> {result}")
+                    logger.info(f"【115自动上传】队列处理结果：{path} -> {result}")
             except Exception:
                 logger.exception(f"【115自动上传】实时处理失败：{key}")
             finally:
@@ -1392,27 +1762,38 @@ class U115AutoUpload(_PluginBase):
                 self._event_queue.task_done()
         logger.info("【115自动上传】事件处理线程已停止")
 
-    def __enqueue_event(self, path: Path) -> None:
-        """把文件事件去重后放入队列。"""
+    def __is_pending(self, key: str) -> bool:
+        """判断文件是否已在队列或正在处理。"""
+        with self._event_lock:
+            if key in self._pending_events:
+                return True
+        with self._inflight_lock:
+            return key in self._inflight
+
+    def __enqueue_event(self, path: Path, source: str = "watchdog") -> bool:
+        """把文件事件去重后放入上传队列。"""
         if not self._enabled:
-            return
+            return False
         try:
             path.relative_to(Path(self._watch_dir))
         except ValueError:
-            return
+            return False
         if not self.__match_extension(path):
-            return
+            return False
         key = str(path)
         with self._event_lock:
             if key in self._pending_events:
-                return
+                return False
             self._pending_events.add(key)
         try:
             self._event_queue.put_nowait(key)
         except queue.Full:
             with self._event_lock:
                 self._pending_events.discard(key)
-            logger.warn("【115自动上传】实时事件队列已满，依赖定时扫描兜底")
+            logger.warn("【115自动上传】上传队列已满，依赖定时扫描兜底")
+            return False
+        logger.info(f"【115自动上传】加入上传队列（{source}）：{path}")
+        return True
 
     def __wait_until_stable(self, path: Path) -> bool:
         """等待文件大小和修改时间稳定，超时后交给定时扫描。"""
@@ -1537,6 +1918,7 @@ class U115AutoUpload(_PluginBase):
                 "enabled": self._enabled,
                 "onlyonce": False,
                 "watchdog": self._watchdog_enabled,
+                "notify": self._notify,
                 "watch_dir": self._watch_dir,
                 "target_dir": self._target_dir,
                 "recursive": self._recursive,
@@ -1858,6 +2240,14 @@ class U115AutoUpload(_PluginBase):
 
     def __record_actions(self, record: Dict[str, Any]) -> List[dict]:
         """构造一条记录的重试和删除按钮。"""
+        if record.get("active"):
+            return [
+                {
+                    "component": "span",
+                    "props": {"class": "text-caption text-medium-emphasis"},
+                    "text": "后台处理中...",
+                }
+            ]
         actions = []
         if record.get("status") in {"failed", "pending"}:
             actions.append(
@@ -1885,6 +2275,8 @@ class U115AutoUpload(_PluginBase):
             "success": ("成功", "success"),
             "failed": ("失败", "error"),
             "pending": ("待处理", "warning"),
+            "uploading": ("上传中", "info"),
+            "probing": ("秒传探测中", "info"),
             "skipped": ("已跳过", "grey"),
         }
         text, color = mapping.get(status, (status or "未知", "grey"))
@@ -1912,8 +2304,12 @@ class U115AutoUpload(_PluginBase):
     @staticmethod
     def __method_text(method: Any) -> str:
         """把上传方式标识转换成中文。"""
+        value = str(method or "")
+        if value.startswith("rapid:"):
+            attempt = value.split(":", 1)[1]
+            return f"秒传（第{attempt}次）"
         return {
             "rapid": "秒传",
             "normal": "普通上传",
             "legacy": "旧版记录",
-        }.get(str(method or ""), "-")
+        }.get(value, "-")
