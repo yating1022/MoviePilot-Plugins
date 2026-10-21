@@ -9,7 +9,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 from fastapi import Body
 from sqlalchemy import (
@@ -129,10 +129,15 @@ def probe_rapid_upload_once(
     file_sha1: Optional[str] = None,
     file_preid: Optional[str] = None,
     diagnostics: Optional[Dict[str, Any]] = None,
+    folder_resolver: Optional[Callable[[], Optional[FileItem]]] = None,
 ) -> Optional[FileItem]:
     """只执行一次 115 秒传探测，不触发普通上传。"""
     if diagnostics is None:
         diagnostics = {}
+    if folder_resolver is not None:
+        resolved = folder_resolver()
+        if resolved is not None:
+            target_dir = resolved
     if not target_dir.fileid:
         raise ValueError("115 目标目录缺少 fileid")
 
@@ -174,6 +179,12 @@ def probe_rapid_upload_once(
         with open(local_path, "rb") as file:
             file.seek(start)
             sign_val = hashlib.sha1(file.read(end - start + 1)).hexdigest().upper()
+        if folder_resolver is not None:
+            resolved = folder_resolver()
+            if resolved is not None:
+                target_dir = resolved
+                target_path = Path(target_dir.path) / target_name
+                init_data["target"] = f"U_1_{target_dir.fileid}"
         init_data.update(
             {
                 "pick_code": init_result.get("pick_code"),
@@ -260,6 +271,7 @@ def rapid_upload_with_retry(
     retry_interval: float = 5.0,
     hash_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     progress_state: Optional[Dict[str, Any]] = None,
+    folder_resolver: Optional[Callable[[], Optional[FileItem]]] = None,
 ) -> Tuple[Optional[FileItem], str, int]:
     """
     先探测 retry_times 次秒传，全部未命中后再调用宿主普通上传。
@@ -316,6 +328,7 @@ def rapid_upload_with_retry(
             file_sha1=file_sha1,
             file_preid=file_preid,
             diagnostics=diagnostics,
+            folder_resolver=folder_resolver,
         )
         if item:
             logger.info(
@@ -336,6 +349,10 @@ def rapid_upload_with_retry(
             time.sleep(retry_interval)
 
     logger.info("【115秒传】探测次数已用尽，回退到宿主普通上传")
+    if folder_resolver is not None:
+        resolved = folder_resolver()
+        if resolved is not None:
+            target_dir = resolved
     if progress_state is not None:
         progress_state["phase"] = "uploading"
         progress_state["normal_started"] = time.monotonic()
@@ -381,7 +398,7 @@ class U115AutoUpload(_PluginBase):
 
     plugin_name = "115 目录秒传上传"
     plugin_desc = "实时监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
-    plugin_version = "1.2.3"
+    plugin_version = "1.3.0"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "u115autoupload_"
@@ -402,6 +419,7 @@ class U115AutoUpload(_PluginBase):
     _watch_dir = ""
     _target_dir = ""
     _recursive = True
+    _preserve_structure = True
     _scan_interval = 60
     _rapid_retry = 3
     _rapid_interval = 5.0
@@ -451,6 +469,7 @@ class U115AutoUpload(_PluginBase):
         )
         self._target_dir = str(config.get("target_dir") or "").strip()
         self._recursive = bool(config.get("recursive", True))
+        self._preserve_structure = bool(config.get("preserve_structure", True))
         self._scan_interval = max(10, int(config.get("scan_interval") or 60))
         self._rapid_retry = max(0, int(config.get("rapid_retry") or 0))
         self._rapid_interval = max(0.0, float(config.get("rapid_interval") or 5))
@@ -647,7 +666,20 @@ class U115AutoUpload(_PluginBase):
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "recursive",
-                                            "label": "递归子目录并保留目录结构",
+                                            "label": "递归监控子目录",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "preserve_structure",
+                                            "label": "保留相对目录结构",
                                         },
                                     }
                                 ],
@@ -811,6 +843,7 @@ class U115AutoUpload(_PluginBase):
             "watch_dir": "",
             "target_dir": "",
             "recursive": True,
+            "preserve_structure": True,
             "scan_interval": 60,
             "rapid_retry": 3,
             "rapid_interval": 5,
@@ -1401,6 +1434,9 @@ class U115AutoUpload(_PluginBase):
                         retry_interval=self._rapid_interval,
                         hash_cache=self._hash_cache,
                         progress_state=progress_state,
+                        folder_resolver=lambda: self.__resolve_folder(
+                            api, remote_dir
+                        ),
                     )
             except Exception as err:
                 logger.exception(f"【115自动上传】上传 {local_path} 失败")
@@ -1918,12 +1954,12 @@ class U115AutoUpload(_PluginBase):
         return True
 
     def __remote_dir(self, watch_dir: Path, path: Path) -> str:
-        """计算文件对应的 115 目录，递归时保留相对目录结构。"""
+        """计算文件对应的 115 目录，按配置决定是否保留相对目录结构。"""
         target = self._target_dir.strip()
         if not target.startswith("/"):
             target = "/" + target
         target = target.rstrip("/") or "/"
-        if not self._recursive:
+        if not self._recursive or not self._preserve_structure:
             return target
         relative_parent = path.relative_to(watch_dir).parent
         if relative_parent.parts:
@@ -1993,6 +2029,7 @@ class U115AutoUpload(_PluginBase):
                 "watch_dir": self._watch_dir,
                 "target_dir": self._target_dir,
                 "recursive": self._recursive,
+                "preserve_structure": self._preserve_structure,
                 "scan_interval": self._scan_interval,
                 "rapid_retry": self._rapid_retry,
                 "rapid_interval": self._rapid_interval,
