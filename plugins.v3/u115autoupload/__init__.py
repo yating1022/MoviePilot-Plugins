@@ -316,82 +316,204 @@ class U115AutoUpload(_PluginBase):
                 "component": "VForm",
                 "content": [
                     {
-                        "component": "VSwitch",
-                        "props": {"model": "enabled", "label": "启用插件"},
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {"model": "enabled", "label": "启用插件"},
+                                    }
+                                ],
+                            }
+                        ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "watch_dir",
-                            "label": "本地监控目录",
-                            "placeholder": "/downloads/watch",
-                        },
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "watch_dir",
+                                            "label": "本地监控目录",
+                                            "placeholder": "/downloads/watch",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "target_dir",
+                                            "label": "115 目标目录",
+                                            "placeholder": "/我的备份",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "target_dir",
-                            "label": "115 目标目录",
-                            "placeholder": "/我的备份",
-                        },
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "recursive",
+                                            "label": "递归子目录并保留目录结构",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "delete_after_upload",
+                                            "label": "上传成功后删除本地文件",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                     {
-                        "component": "VSwitch",
-                        "props": {"model": "recursive", "label": "递归子目录并保留目录结构"},
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "upload_existing",
+                                            "label": "首次启用时也上传目录中已有文件",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "scan_interval",
-                            "label": "扫描间隔（秒）",
-                            "type": "number",
-                        },
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "scan_interval",
+                                            "label": "扫描间隔（秒）",
+                                            "type": "number",
+                                            "min": 10,
+                                            "step": 1,
+                                            "hint": "定时扫描监控目录的间隔",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "rapid_retry",
+                                            "label": "秒传探测次数",
+                                            "type": "number",
+                                            "min": 0,
+                                            "step": 1,
+                                            "hint": "每次上传前最多探测几次秒传",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "rapid_retry",
-                            "label": "秒传探测次数",
-                            "type": "number",
-                        },
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "rapid_interval",
+                                            "label": "失败后重试间隔（秒）",
+                                            "type": "number",
+                                            "min": 0,
+                                            "step": 1,
+                                            "hint": "本次探测失败返回后，等待这么久再探测下一次",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "stable_seconds",
+                                            "label": "文件稳定时间（秒）",
+                                            "type": "number",
+                                            "min": 0,
+                                            "step": 1,
+                                            "hint": "文件修改时间超过这个时间才会上传，避免上传未写完的文件",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
                     },
                     {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "rapid_interval",
-                            "label": "失败后重试间隔（秒）",
-                            "type": "number",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "stable_seconds",
-                            "label": "文件稳定时间（秒）",
-                            "type": "number",
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "extensions",
-                            "label": "只处理这些后缀（逗号分隔，留空为全部）",
-                            "placeholder": ".mkv,.mp4,.iso",
-                        },
-                    },
-                    {
-                        "component": "VSwitch",
-                        "props": {
-                            "model": "delete_after_upload",
-                            "label": "上传成功后删除本地文件",
-                        },
-                    },
-                    {
-                        "component": "VSwitch",
-                        "props": {
-                            "model": "upload_existing",
-                            "label": "首次启用时也上传目录中已有文件",
-                        },
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "extensions",
+                                            "label": "只处理这些后缀（逗号分隔，留空为全部）",
+                                            "placeholder": ".mkv,.mp4,.iso",
+                                            "hint": "例如 .mkv,.mp4,.iso；留空表示全部文件",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
                     },
                 ],
             }
