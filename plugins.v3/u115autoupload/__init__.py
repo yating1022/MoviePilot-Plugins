@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import queue
 import threading
 import time
@@ -365,7 +366,7 @@ class U115AutoUpload(_PluginBase):
 
     plugin_name = "115 目录秒传上传"
     plugin_desc = "实时监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "u115autoupload_"
@@ -394,6 +395,8 @@ class U115AutoUpload(_PluginBase):
     _upload_existing = False
     _watchdog_enabled = True
     _onlyonce = False
+    _page = 1
+    _page_size = 10
 
     def __init__(self) -> None:
         """初始化扫描锁、数据库缓存和实时事件队列。"""
@@ -503,6 +506,13 @@ class U115AutoUpload(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "清理全部成功记录",
+            },
+            {
+                "path": "/records/page",
+                "endpoint": self.api_records_page,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "切换记录列表页码",
             },
         ]
 
@@ -765,13 +775,18 @@ class U115AutoUpload(_PluginBase):
         }
 
     def get_page(self) -> Optional[List[dict]]:
-        """返回上传记录列表和重试/删除操作页面。"""
-        records = self.__list_records(limit=200)
+        """返回固定高度、可分页的上传记录列表和操作页面。"""
         summary = self.__record_summary()
         success = summary.get("success", 0)
         failed = summary.get("failed", 0)
         pending = summary.get("pending", 0)
         total = success + failed + pending
+        pages = max(1, math.ceil(total / self._page_size))
+        self._page = min(max(1, self._page), pages)
+        records = self.__list_records(
+            limit=self._page_size,
+            offset=(self._page - 1) * self._page_size,
+        )
 
         contents: List[dict] = []
         if not self._enabled:
@@ -781,7 +796,7 @@ class U115AutoUpload(_PluginBase):
                     "props": {
                         "type": "warning",
                         "variant": "tonal",
-                        "class": "mb-3",
+                        "class": "mb-3 flex-shrink-0",
                         "text": "插件未启用，以下为历史记录。",
                     },
                 }
@@ -792,10 +807,11 @@ class U115AutoUpload(_PluginBase):
                 "props": {
                     "type": "info",
                     "variant": "tonal",
-                    "class": "mb-3",
+                    "class": "mb-3 flex-shrink-0",
                     "text": (
                         f"共 {total} 条记录：成功 {success}，失败 {failed}，"
-                        f"待处理 {pending}。仅显示最近 200 条。"
+                        f"待处理 {pending}。第 {self._page}/{pages} 页，"
+                        f"每页 {self._page_size} 条。"
                     ),
                 },
             }
@@ -806,7 +822,7 @@ class U115AutoUpload(_PluginBase):
                 "props": {
                     "type": "warning",
                     "variant": "tonal",
-                    "class": "mb-3",
+                    "class": "mb-3 flex-shrink-0",
                     "text": "删除记录不会删除网盘文件；如果本地文件仍在，下一轮扫描会重新上传。重试在后台执行，稍后刷新查看结果。",
                 },
             }
@@ -814,7 +830,7 @@ class U115AutoUpload(_PluginBase):
         contents.append(
             {
                 "component": "div",
-                "props": {"class": "d-flex flex-wrap ga-2 mb-3"},
+                "props": {"class": "d-flex flex-wrap ga-2 mb-3 flex-shrink-0"},
                 "content": [
                     self.__page_button("立即扫描", "mdi-play", "/scan"),
                     self.__page_button(
@@ -824,81 +840,150 @@ class U115AutoUpload(_PluginBase):
             }
         )
 
-        if not records:
+        if records:
+            headers = [
+                "状态",
+                "本地文件",
+                "大小",
+                "远端路径",
+                "方式",
+                "次数",
+                "错误",
+                "更新时间",
+                "操作",
+            ]
+            ths = [{"component": "th", "text": header} for header in headers]
+            rows = []
+            for record in records:
+                rows.append(
+                    {
+                        "component": "tr",
+                        "content": [
+                            {
+                                "component": "td",
+                                "content": [
+                                    self.__status_chip(
+                                        str(record.get("status") or "")
+                                    )
+                                ],
+                            },
+                            self.__text_cell(
+                                record.get("relative_path")
+                                or record.get("local_path"),
+                                title=record.get("local_path"),
+                            ),
+                            self.__text_cell(
+                                _format_size(int(record.get("file_size") or 0))
+                            ),
+                            self.__text_cell(
+                                record.get("remote_path") or "-",
+                                title=record.get("remote_path"),
+                            ),
+                            self.__text_cell(
+                                self.__method_text(record.get("method"))
+                            ),
+                            self.__text_cell(str(record.get("retry_count") or 0)),
+                            self.__text_cell(
+                                record.get("error") or "-",
+                                title=record.get("error"),
+                            ),
+                            self.__text_cell(record.get("updated_at") or "-"),
+                            {
+                                "component": "td",
+                                "content": self.__record_actions(record),
+                            },
+                        ],
+                    }
+                )
+
             contents.append(
                 {
-                    "component": "VAlert",
+                    "component": "div",
                     "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "text": "暂无处理记录。",
+                        "class": "flex-grow-1",
+                        "style": "min-height: 0; overflow: auto;",
                     },
-                }
-            )
-            return contents
-
-        headers = [
-            "状态",
-            "本地文件",
-            "大小",
-            "远端路径",
-            "方式",
-            "次数",
-            "错误",
-            "更新时间",
-            "操作",
-        ]
-        ths = [{"component": "th", "text": header} for header in headers]
-        rows = []
-        for record in records:
-            rows.append(
-                {
-                    "component": "tr",
                     "content": [
                         {
-                            "component": "td",
+                            "component": "VTable",
+                            "props": {"density": "compact", "hover": True},
                             "content": [
-                                self.__status_chip(str(record.get("status") or ""))
+                                {
+                                    "component": "thead",
+                                    "props": {
+                                        "style": "position: sticky; top: 0; z-index: 1; background: rgb(var(--v-theme-surface));",
+                                    },
+                                    "content": [
+                                        {"component": "tr", "content": ths}
+                                    ],
+                                },
+                                {"component": "tbody", "content": rows},
                             ],
-                        },
-                        self.__text_cell(
-                            record.get("relative_path") or record.get("local_path"),
-                            title=record.get("local_path"),
-                        ),
-                        self.__text_cell(_format_size(int(record.get("file_size") or 0))),
-                        self.__text_cell(
-                            record.get("remote_path") or "-",
-                            title=record.get("remote_path"),
-                        ),
-                        self.__text_cell(self.__method_text(record.get("method"))),
-                        self.__text_cell(str(record.get("retry_count") or 0)),
-                        self.__text_cell(
-                            record.get("error") or "-",
-                            title=record.get("error"),
-                        ),
-                        self.__text_cell(record.get("updated_at") or "-"),
+                        }
+                    ],
+                }
+            )
+        else:
+            contents.append(
+                {
+                    "component": "div",
+                    "props": {
+                        "class": "d-flex align-center justify-center flex-grow-1",
+                        "style": "min-height: 0;",
+                    },
+                    "content": [
                         {
-                            "component": "td",
-                            "content": self.__record_actions(record),
-                        },
+                            "component": "VAlert",
+                            "props": {
+                                "type": "info",
+                                "variant": "tonal",
+                                "text": "暂无处理记录。",
+                            },
+                        }
                     ],
                 }
             )
 
         contents.append(
             {
-                "component": "VTable",
-                "props": {"density": "compact", "hover": True},
+                "component": "div",
+                "props": {
+                    "class": "d-flex align-center justify-center ga-2 mt-2 flex-shrink-0",
+                },
                 "content": [
+                    self.__page_button(
+                        "上一页",
+                        "mdi-chevron-left",
+                        "/records/page",
+                        {"page": self._page - 1},
+                        disabled=self._page <= 1,
+                    ),
                     {
-                        "component": "thead",
-                        "content": [{"component": "tr", "content": ths}],
+                        "component": "span",
+                        "props": {"class": "text-body-2"},
+                        "text": f"第 {self._page} / {pages} 页",
                     },
-                    {"component": "tbody", "content": rows},
+                    self.__page_button(
+                        "下一页",
+                        "mdi-chevron-right",
+                        "/records/page",
+                        {"page": self._page + 1},
+                        disabled=self._page >= pages,
+                    ),
                 ],
             }
         )
-        return contents
+
+        return [
+            {
+                "component": "div",
+                "props": {
+                    "class": "d-flex flex-column",
+                    "style": "height: 72vh; min-height: 520px; max-height: 800px; padding-bottom: 84px; box-sizing: border-box;",
+                },
+                "content": contents,
+            }
+        ]
 
     def get_service(self) -> Optional[List[Dict[str, Any]]]:
         """注册定时兜底扫描服务。"""
@@ -993,6 +1078,16 @@ class U115AutoUpload(_PluginBase):
         except Exception:
             logger.exception("【115自动上传】清理成功记录失败")
             return {"success": False, "message": "数据库操作失败"}
+
+    def api_records_page(self, payload: dict = Body(...)) -> Dict[str, Any]:
+        """切换记录列表页码，页面重新加载后生效。"""
+        try:
+            page = int(payload.get("page") or 1)
+        except (TypeError, ValueError):
+            page = 1
+        self._page = max(1, page)
+        logger.debug(f"【115自动上传】记录列表切换到第 {self._page} 页")
+        return {"success": True, "message": f"第 {self._page} 页"}
 
     def scan_once(self) -> None:
         """执行一次目录扫描；上一轮未结束时直接跳过。"""
@@ -1648,15 +1743,18 @@ class U115AutoUpload(_PluginBase):
         except Exception:
             logger.exception(f"【115自动上传】保存上传记录失败：{local_path}")
 
-    def __list_records(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """查询最近的上传记录，跳过初始化时产生的 skipped 记录。"""
+    def __list_records(
+        self, limit: int = 200, offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """查询分页的上传记录，跳过初始化时产生的 skipped 记录。"""
         try:
             with self.get_database().session() as session:
                 statement = (
                     select(U115UploadRecord)
                     .where(U115UploadRecord.status != "skipped")
                     .order_by(U115UploadRecord.updated_at.desc())
-                    .limit(limit)
+                    .offset(max(0, offset))
+                    .limit(max(1, limit))
                 )
                 return [
                     self.__record_to_dict(record)
@@ -1734,6 +1832,7 @@ class U115AutoUpload(_PluginBase):
         icon: str,
         path: str,
         params: Optional[dict] = None,
+        disabled: bool = False,
     ) -> dict:
         """构造带 API 点击事件的页面按钮。"""
         event: Dict[str, Any] = {
@@ -1742,14 +1841,17 @@ class U115AutoUpload(_PluginBase):
         }
         if params is not None:
             event["params"] = params
+        props: Dict[str, Any] = {
+            "size": "small",
+            "variant": "tonal",
+            "prepend-icon": icon,
+            "class": "ma-1",
+        }
+        if disabled:
+            props["disabled"] = True
         return {
             "component": "VBtn",
-            "props": {
-                "size": "small",
-                "variant": "tonal",
-                "prepend-icon": icon,
-                "class": "ma-1",
-            },
+            "props": props,
             "text": text,
             "events": {"click": event},
         }
