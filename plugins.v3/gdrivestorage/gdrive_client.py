@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Set, Tuple
 from urllib.parse import urlencode
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
@@ -23,6 +23,7 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE_DRIVE = "https://www.googleapis.com/auth/drive"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GOOGLE_DOC_PREFIX = "application/vnd.google-apps."
 
 FILE_FIELDS = (
@@ -86,11 +87,20 @@ class DriveItem:
     thumbnail_link: Optional[str] = None
     drive_id: Optional[str] = None
     path: str = "/"
+    # 快捷方式信息：id 是目标 ID；这两个字段只用于对“快捷方式本身”执行删除/改名/移动
+    shortcut_id: Optional[str] = None
+    shortcut_parents: List[str] = field(default_factory=list)
+    shortcut_name: Optional[str] = None
 
     @property
     def is_dir(self) -> bool:
-        """是否为 Google Drive 文件夹。"""
+        """是否为 Google Drive 文件夹（快捷方式已解析到目标类型）。"""
         return self.mime_type == FOLDER_MIME
+
+    @property
+    def is_shortcut(self) -> bool:
+        """是否由快捷方式解析而来。"""
+        return bool(self.shortcut_id)
 
     @property
     def is_google_doc(self) -> bool:
@@ -262,6 +272,9 @@ class GoogleDriveClient:
         self._access_token: Optional[str] = None
         self._expires_at = 0.0
         self._folder_cache: Dict[str, Tuple[str, float]] = {}
+        self._raw_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+        self._shortcut_paths: Dict[str, Dict[str, Any]] = {}
+        self._shortcut_negative: Set[str] = set()
         self._cache_lock = threading.RLock()
 
     # ------------------------------------------------------------------
@@ -275,9 +288,53 @@ class GoogleDriveClient:
                 close()
 
     def clear_cache(self) -> None:
-        """清空路径到 ID 的缓存。"""
+        """清空路径/元数据缓存；保留快捷方式路径映射以避免误操作目标目录。"""
         with self._cache_lock:
             self._folder_cache.clear()
+            self._raw_cache.clear()
+            self._shortcut_negative.clear()
+
+    def forget_shortcut(self, path: Any) -> None:
+        """删除某个快捷方式挂载路径的缓存。"""
+        key = self.normalize_virtual_path(path).rstrip("/") or "/"
+        with self._cache_lock:
+            self._shortcut_paths.pop(key, None)
+            self._shortcut_negative.discard(key)
+
+    def shortcut_info_for_path(self, path: Any) -> Optional[Dict[str, Any]]:
+        """
+        返回路径对应的快捷方式信息。
+
+        缓存未命中时会解析一次路径，避免插件重载后丢失映射而误操作目标目录。
+
+        :param path: 对外虚拟路径
+        :return: ``{"id", "parents", "name", "target_mime"}``；不是快捷方式挂载点时返回 None
+        """
+        key = self.normalize_virtual_path(path).rstrip("/") or "/"
+        with self._cache_lock:
+            info = self._shortcut_paths.get(key)
+            if info:
+                return dict(info)
+            if key in self._shortcut_negative:
+                return None
+        try:
+            item = self.get_item(path)
+        except (GoogleDriveError, ValueError):
+            item = None
+        if item and item.shortcut_id:
+            with self._cache_lock:
+                info = self._shortcut_paths.get(key)
+                if info:
+                    return dict(info)
+            return {
+                "id": item.shortcut_id,
+                "parents": list(item.shortcut_parents),
+                "name": item.shortcut_name or item.name,
+                "target_mime": item.mime_type,
+            }
+        with self._cache_lock:
+            self._shortcut_negative.add(key)
+        return None
 
     # ------------------------------------------------------------------
     # OAuth2
@@ -537,7 +594,11 @@ class GoogleDriveClient:
             found = self._find_child(parent_id, name)
             if not found:
                 return None
-            found.path = self.normalize_virtual_path(path)
+            normalized = self.normalize_virtual_path(path)
+            found.path = (
+                normalized if not found.is_dir or normalized.endswith("/")
+                else normalized + "/"
+            )
             return found
         except GoogleDriveNotFound:
             # 父目录已被删除或不可见时按“不存在”处理
@@ -553,6 +614,30 @@ class GoogleDriveClient:
         """
         if not file_id:
             return None
+        raw = self._get_raw_item(file_id)
+        if not raw:
+            return None
+        item = self._to_drive_item(raw, virtual_path or self.root_path)
+        if item.trashed:
+            return None
+        return item
+
+    def _get_raw_item(self, file_id: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        """
+        读取 Drive File 原始 JSON，并缓存短期结果。
+
+        :param file_id: 文件/目录 ID
+        :param use_cache: 是否使用缓存
+        :return: File 资源字典；不存在返回 None
+        """
+        if not file_id:
+            return None
+        now = time.monotonic()
+        if use_cache and self._cache_ttl > 0:
+            with self._cache_lock:
+                cached = self._raw_cache.get(file_id)
+                if cached and cached[1] > now:
+                    return dict(cached[0])
         try:
             response = self._request(
                 "GET",
@@ -561,10 +646,13 @@ class GoogleDriveClient:
             )
         except GoogleDriveNotFound:
             return None
-        item = self._to_drive_item(self._json(response), virtual_path or self.root_path)
-        if item.trashed:
+        raw = self._json(response)
+        if not raw:
             return None
-        return item
+        if self._cache_ttl > 0:
+            with self._cache_lock:
+                self._raw_cache[file_id] = (dict(raw), now + self._cache_ttl)
+        return raw
 
     def _find_child(
             self,
@@ -582,19 +670,17 @@ class GoogleDriveClient:
         :return: 命中的子项；不存在返回 None
         """
         query = f"name = '{self._escape_query(name)}' and '{self._escape_query(parent_id)}' in parents and trashed = false"
-        if folder is True:
-            query += f" and mimeType = '{FOLDER_MIME}'"
-        elif folder is False:
-            query += f" and mimeType != '{FOLDER_MIME}'"
+        # 不能只按 mimeType 过滤文件夹：指向团队盘目录的快捷方式
+        # mimeType 是 shortcut，解析后才是 folder。
         items = self._list_query(query, parent_path=self.root_path)
         if not items:
             return None
-        # 同名项可能存在；目录查询优先目录，普通查询优先非目录
-        if folder is None:
-            for item in items:
-                if not item.is_dir:
-                    return item
-        return items[0]
+        if folder is True:
+            return next((item for item in items if item.is_dir), None)
+        if folder is False:
+            return next((item for item in items if not item.is_dir), None)
+        # 不限类型时优先文件，保持旧行为
+        return next((item for item in items if not item.is_dir), items[0])
 
     def _list_query(self, query: str, parent_path: str) -> List[DriveItem]:
         """
@@ -1172,15 +1258,26 @@ class GoogleDriveClient:
                 return str(errors[0].get("reason") or "") or None
         return None
 
-    def _to_drive_item(self, raw: Mapping[str, Any], virtual_path: str) -> DriveItem:
+    def _to_drive_item(
+            self,
+            raw: Mapping[str, Any],
+            virtual_path: str,
+            *,
+            shortcut: Optional[Mapping[str, Any]] = None,
+            depth: int = 0,
+    ) -> DriveItem:
         """
-        把 Drive File JSON 转换为中立模型。
+        把 Drive File JSON 转换为中立模型；快捷方式自动解析到目标。
 
-        :param raw: Drive API 的 File 资源
-        :param virtual_path: 对外虚拟路径
-        :return: DriveItem
+        目录快捷方式（团队盘快捷方式）直接按目标目录处理，不需要额外 GET；
+        文件快捷方式会读取一次目标元数据以取得大小/修改时间。
         """
         mime_type = str(raw.get("mimeType") or "")
+        if mime_type == SHORTCUT_MIME:
+            return self._resolve_shortcut(
+                raw, virtual_path, depth=depth, outer=shortcut,
+            )
+
         is_dir = mime_type == FOLDER_MIME
         name = str(raw.get("name") or "")
         path = self.normalize_virtual_path(virtual_path)
@@ -1193,9 +1290,10 @@ class GoogleDriveClient:
         except (TypeError, ValueError):
             size = None
         parents = raw.get("parents")
-        return DriveItem(
+        shortcut_parents = shortcut.get("parents") if shortcut else None
+        item = DriveItem(
             id=str(raw.get("id") or ""),
-            name=name,
+            name=str(shortcut.get("name") or name) if shortcut else name,
             mime_type=mime_type,
             parents=[str(parent) for parent in parents] if isinstance(parents, list) else [],
             size=size,
@@ -1206,6 +1304,102 @@ class GoogleDriveClient:
             thumbnail_link=raw.get("thumbnailLink"),
             drive_id=raw.get("driveId"),
             path=path,
+            shortcut_id=str(shortcut.get("id") or "") if shortcut else None,
+            shortcut_parents=(
+                [str(parent) for parent in shortcut_parents]
+                if isinstance(shortcut_parents, list) else []
+            ),
+            shortcut_name=str(shortcut.get("name") or "") if shortcut else None,
+        )
+        if shortcut:
+            self._remember_shortcut(path, shortcut)
+        return item
+
+    def _remember_shortcut(self, path: str, shortcut: Mapping[str, Any]) -> None:
+        """记录快捷方式路径，供删除/改名/移动时操作快捷方式本身。"""
+        key = self.normalize_virtual_path(path).rstrip("/") or "/"
+        parents = shortcut.get("parents")
+        details = shortcut.get("shortcutDetails") or {}
+        info = {
+            "id": str(shortcut.get("id") or ""),
+            "parents": [str(parent) for parent in parents] if isinstance(parents, list) else [],
+            "name": str(shortcut.get("name") or ""),
+            "target_mime": str(details.get("targetMimeType") or ""),
+        }
+        with self._cache_lock:
+            self._shortcut_paths[key] = info
+            self._shortcut_negative.discard(key)
+
+    def _resolve_shortcut(
+            self,
+            raw: Mapping[str, Any],
+            virtual_path: str,
+            *,
+            depth: int = 0,
+            outer: Optional[Mapping[str, Any]] = None,
+    ) -> DriveItem:
+        """
+        解析快捷方式到目标文件/目录。
+
+        目录目标直接使用 ``shortcutDetails.targetMimeType``，避免额外请求；
+        文件目标读取一次元数据以补齐大小和修改时间。目标不可访问时退化为普通文件。
+        ``outer`` 用于嵌套快捷方式时保留用户实际看到的最外层快捷方式身份。
+        """
+        outer = outer or raw
+        details = raw.get("shortcutDetails") or {}
+        if depth >= 2:
+            fallback_mime = str(details.get("targetMimeType") or "application/octet-stream")
+            fallback = {
+                **raw,
+                "id": str(details.get("targetId") or raw.get("id") or ""),
+                "mimeType": fallback_mime,
+            }
+            return self._to_drive_item(fallback, virtual_path, depth=depth)
+        target_id = str(details.get("targetId") or "")
+        target_mime = str(details.get("targetMimeType") or "")
+        if not target_id:
+            return self._to_drive_item(
+                dict(raw, mimeType="application/octet-stream"),
+                virtual_path,
+                depth=depth + 1,
+            )
+        if target_mime == FOLDER_MIME:
+            # 目录快捷方式不需要读取目标元数据；子项列举直接用目标 ID
+            synthetic = {
+                "id": target_id,
+                "name": str(outer.get("name") or ""),
+                "mimeType": FOLDER_MIME,
+                "parents": outer.get("parents") or [],
+                "modifiedTime": outer.get("modifiedTime"),
+                "createdTime": outer.get("createdTime"),
+                "webViewLink": outer.get("webViewLink"),
+                "thumbnailLink": outer.get("thumbnailLink"),
+                "driveId": outer.get("driveId"),
+            }
+            return self._to_drive_item(
+                synthetic, virtual_path, shortcut=outer, depth=depth + 1,
+            )
+
+        target_raw = self._get_raw_item(target_id)
+        if target_raw and not target_raw.get("trashed"):
+            return self._to_drive_item(
+                target_raw, virtual_path, shortcut=outer, depth=depth + 1,
+            )
+
+        # 目标不可访问或已删除：保留为文件项，后续操作会给出明确错误
+        fallback_mime = target_mime or "application/octet-stream"
+        fallback = {
+            "id": target_id,
+            "name": str(outer.get("name") or ""),
+            "mimeType": fallback_mime,
+            "parents": outer.get("parents") or [],
+            "modifiedTime": outer.get("modifiedTime"),
+            "createdTime": outer.get("createdTime"),
+            "webViewLink": outer.get("webViewLink"),
+            "thumbnailLink": outer.get("thumbnailLink"),
+        }
+        return self._to_drive_item(
+            fallback, virtual_path, shortcut=outer, depth=depth + 1,
         )
 
     @staticmethod

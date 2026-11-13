@@ -29,6 +29,7 @@ from app.sdk.plugin import _PluginBase
 from app.sdk.services import StorageHelper
 
 from .gdrive_client import (
+    FOLDER_MIME,
     DriveItem,
     GoogleDriveAuthError,
     GoogleDriveClient,
@@ -288,13 +289,39 @@ class GDriveStorageProvider:
             self._log("download", fileitem.path or "", True, str(result))
         return result
 
+    def _shortcut_info(self, fileitem: FileItem) -> Optional[Dict[str, Any]]:
+        """返回文件项路径对应的快捷方式信息（如果它是快捷方式挂载点）。"""
+        getter = getattr(self.client, "shortcut_info_for_path", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(fileitem.path)
+        except Exception:
+            return None
+
+    def _forget_shortcut(self, fileitem: FileItem) -> None:
+        """快捷方式被删除/改名/移动后清理其旧路径缓存。"""
+        forget = getattr(self.client, "forget_shortcut", None)
+        if not callable(forget):
+            return
+        try:
+            forget(fileitem.path)
+        except Exception:
+            pass
+
     def copy(self, fileitem: FileItem, path: Path, new_name: str) -> bool:
         """复制文件到同一存储的目标目录。"""
         try:
             target_id = self.client.resolve_folder_id(path, create=True)
-            if not target_id or not fileitem.fileid:
+            shortcut = self._shortcut_info(fileitem)
+            # 目录快捷方式复制快捷方式本身；文件快捷方式复制目标文件内容
+            if shortcut and shortcut.get("target_mime") == FOLDER_MIME:
+                source_id = shortcut["id"]
+            else:
+                source_id = fileitem.fileid
+            if not target_id or not source_id:
                 return False
-            ok = self.client.copy(fileitem.fileid, target_id, new_name)
+            ok = self.client.copy(source_id, target_id, new_name)
         except (GoogleDriveError, ValueError) as err:
             logger.warning(f"【GDrive】复制失败：{fileitem.path} -> {path} - {err}")
             self._log("copy", f"{fileitem.path} -> {path}", False, str(err))
@@ -306,13 +333,20 @@ class GDriveStorageProvider:
         """移动文件到目标目录，可同时改名。"""
         try:
             target_id = self.client.resolve_folder_id(path, create=True)
-            old_parent = fileitem.parent_fileid
-            if not old_parent and fileitem.fileid:
-                detail = self.client.get_item_by_id(fileitem.fileid, fileitem.path)
+            shortcut = self._shortcut_info(fileitem)
+            source_id = shortcut["id"] if shortcut else fileitem.fileid
+            old_parent = (
+                (shortcut.get("parents") or [None])[0]
+                if shortcut else fileitem.parent_fileid
+            )
+            if not old_parent and source_id:
+                detail = self.client.get_item_by_id(source_id, fileitem.path)
                 old_parent = detail.parent_id if detail else None
-            if not target_id or not fileitem.fileid:
+            if not target_id or not source_id:
                 return False
-            ok = self.client.move(fileitem.fileid, old_parent or "", target_id, new_name)
+            ok = self.client.move(source_id, old_parent or "", target_id, new_name)
+            if ok and shortcut:
+                self._forget_shortcut(fileitem)
         except (GoogleDriveError, ValueError) as err:
             logger.warning(f"【GDrive】移动失败：{fileitem.path} -> {path} - {err}")
             self._log("move", f"{fileitem.path} -> {path}", False, str(err))
@@ -322,10 +356,14 @@ class GDriveStorageProvider:
 
     def rename(self, fileitem: FileItem, name: str) -> bool:
         """重命名文件或目录。"""
-        if not fileitem.fileid:
+        shortcut = self._shortcut_info(fileitem)
+        target_id = shortcut["id"] if shortcut else fileitem.fileid
+        if not target_id:
             return False
         try:
-            ok = self.client.rename(fileitem.fileid, name)
+            ok = self.client.rename(target_id, name)
+            if ok and shortcut:
+                self._forget_shortcut(fileitem)
         except GoogleDriveError as err:
             logger.warning(f"【GDrive】重命名失败：{fileitem.path} - {err}")
             self._log("rename", fileitem.path or "", False, str(err))
@@ -334,11 +372,15 @@ class GDriveStorageProvider:
         return ok
 
     def delete(self, fileitem: FileItem) -> bool:
-        """删除文件或目录。"""
-        if not fileitem.fileid:
+        """删除文件或目录；删除快捷方式挂载点时只删除快捷方式本身。"""
+        shortcut = self._shortcut_info(fileitem)
+        target_id = shortcut["id"] if shortcut else fileitem.fileid
+        if not target_id:
             return False
         try:
-            ok = self.client.delete(fileitem.fileid)
+            ok = self.client.delete(target_id)
+            if ok and shortcut:
+                self._forget_shortcut(fileitem)
         except GoogleDriveError as err:
             logger.warning(f"【GDrive】删除失败：{fileitem.path} - {err}")
             self._log("delete", fileitem.path or "", False, str(err))
@@ -377,7 +419,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"

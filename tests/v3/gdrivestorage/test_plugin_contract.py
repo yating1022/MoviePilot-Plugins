@@ -627,6 +627,85 @@ def test_strict_query_types_match_host_contract() -> None:
     assert absent_result.item is None
 
 
+class _ShortcutAwareClient:
+    """记录快捷方式挂载点操作的客户端替身。"""
+
+    def __init__(self) -> None:
+        self.deleted: List[str] = []
+        self.renamed: List[tuple] = []
+        self.moved: List[tuple] = []
+        self.copied: List[tuple] = []
+        self.forgotten: List[Any] = []
+
+    def shortcut_info_for_path(self, path: Any) -> Optional[Dict[str, Any]]:
+        """只把 /TeamDrive 视为快捷方式挂载点。"""
+        if str(path).rstrip("/") == "/TeamDrive":
+            return {
+                "id": "shortcut-1",
+                "parents": ["root"],
+                "name": "TeamDrive",
+                "target_mime": "application/vnd.google-apps.folder",
+            }
+        return None
+
+    def delete(self, file_id: str) -> bool:
+        """记录删除目标。"""
+        self.deleted.append(file_id)
+        return True
+
+    def forget_shortcut(self, path: Any) -> None:
+        """记录快捷方式缓存清理。"""
+        self.forgotten.append(path)
+
+    def rename(self, file_id: str, name: str) -> bool:
+        """记录重命名目标。"""
+        self.renamed.append((file_id, name))
+        return True
+
+    def resolve_folder_id(self, path: Any, create: bool = False) -> str:
+        """返回固定的目标目录。"""
+        return "target-folder"
+
+    def move(self, file_id: str, old_parent: str, target_parent: str, new_name: str) -> bool:
+        """记录移动目标。"""
+        self.moved.append((file_id, old_parent, target_parent, new_name))
+        return True
+
+    def copy(self, file_id: str, target_parent: str, new_name: str) -> bool:
+        """记录复制目标。"""
+        self.copied.append((file_id, target_parent, new_name))
+        return True
+
+
+def test_shortcut_mount_operations_target_shortcut_not_shared_folder() -> None:
+    """删除/改名/移动快捷方式挂载点时操作快捷方式本身，子文件才操作目标。"""
+    module = _load_plugin_module()
+    client = _ShortcutAwareClient()
+    provider = module.GDriveStorageProvider(client, lambda *args, **kwargs: None)
+    mount = _StubFileItem(
+        storage="gdrive", path="/TeamDrive/", type="dir", fileid="folder-1",
+    )
+    child = _StubFileItem(
+        storage="gdrive", path="/TeamDrive/a.mkv", type="file", fileid="child-1",
+    )
+
+    assert provider.delete(mount) is True
+    assert client.deleted[-1] == "shortcut-1"
+    assert client.forgotten[-1] == "/TeamDrive/"
+
+    assert provider.delete(child) is True
+    assert client.deleted[-1] == "child-1"
+
+    assert provider.rename(mount, "Renamed") is True
+    assert client.renamed[-1] == ("shortcut-1", "Renamed")
+
+    assert provider.move(mount, Path("/Other"), "Renamed") is True
+    assert client.moved[-1] == ("shortcut-1", "root", "target-folder", "Renamed")
+
+    assert provider.copy(mount, Path("/Other"), "Copied") is True
+    assert client.copied[-1] == ("shortcut-1", "target-folder", "Copied")
+
+
 def test_no_forbidden_host_imports() -> None:
     """插件源码不得导入宿主内部模块。"""
     for node in ast.walk(_tree()):

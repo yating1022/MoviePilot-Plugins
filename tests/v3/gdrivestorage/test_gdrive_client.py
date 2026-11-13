@@ -148,6 +148,26 @@ def _file_payload(
     }
 
 
+def _shortcut_payload(
+        shortcut_id: str = "shortcut-1",
+        name: str = "TeamDrive",
+        target_id: str = "folder-1",
+        target_mime: str = client_module.FOLDER_MIME,
+) -> Dict[str, Any]:
+    """构造指向团队盘目录/文件的快捷方式 JSON。"""
+    return {
+        "id": shortcut_id,
+        "name": name,
+        "mimeType": client_module.SHORTCUT_MIME,
+        "parents": ["root"],
+        "modifiedTime": "2024-01-01T00:00:00.000Z",
+        "shortcutDetails": {
+            "targetId": target_id,
+            "targetMimeType": target_mime,
+        },
+    }
+
+
 def test_build_auth_url_contains_offline_and_drive_scope() -> None:
     """授权 URL 必须包含 offline/consent/full drive scope。"""
     transport = FakeTransport([])
@@ -256,6 +276,87 @@ def test_get_item_resolves_nested_path() -> None:
     assert transport.calls[0]["params"]["q"].startswith("name = 'Movies'")
     assert "'root' in parents" in transport.calls[0]["params"]["q"]
     assert transport.calls[1]["params"]["q"].startswith("name = 'a.mkv'")
+
+
+def test_shortcut_to_folder_is_treated_as_directory() -> None:
+    """根目录下的团队盘快捷方式应直接按目标目录处理，无需额外 GET。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [_shortcut_payload()]}),
+    ])
+    item = _client(transport).get_item("/TeamDrive")
+    assert item is not None
+    assert item.id == "folder-1"
+    assert item.is_dir is True
+    assert item.path == "/TeamDrive/"
+    assert item.shortcut_id == "shortcut-1"
+    assert len(transport.calls) == 1
+
+
+def test_shortcut_folder_lists_target_children() -> None:
+    """解析快捷方式后，子项路径仍使用快捷方式挂载路径。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [_shortcut_payload()]}),
+        FakeResponse(payload={"files": [_file_payload("child-1", "a.mkv", parents=["folder-1"])]}),
+    ])
+    client = _client(transport)
+    mount = client.get_item("/TeamDrive")
+    assert mount is not None
+    items = client.list(mount.id, mount.path)
+    assert len(items) == 1
+    assert items[0].path == "/TeamDrive/a.mkv"
+    assert transport.calls[1]["params"]["q"] == "'folder-1' in parents and trashed = false"
+
+
+def test_shortcut_to_file_resolves_target_metadata() -> None:
+    """文件快捷方式读取目标元数据，但对外路径/名称沿用快捷方式。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [_shortcut_payload(
+            shortcut_id="shortcut-file",
+            name="MovieShortcut",
+            target_id="file-1",
+            target_mime="video/x-matroska",
+        )]}),
+        FakeResponse(payload=_file_payload("file-1", "target.mkv", size="123")),
+    ])
+    item = _client(transport).get_item("/MovieShortcut")
+    assert item is not None
+    assert item.id == "file-1"
+    assert item.name == "MovieShortcut"
+    assert item.mime_type == "video/x-matroska"
+    assert item.size == 123
+    assert item.path == "/MovieShortcut"
+    assert item.shortcut_id == "shortcut-file"
+    assert len(transport.calls) == 2
+
+
+def test_shortcut_info_tracks_mount_path() -> None:
+    """快捷方式挂载路径可被查询，用于安全地删除/改名快捷方式本身。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [_shortcut_payload()]}),
+    ])
+    client = _client(transport)
+    assert client.get_item("/TeamDrive") is not None
+    info = client.shortcut_info_for_path("/TeamDrive/")
+    assert info is not None
+    assert info["id"] == "shortcut-1"
+    assert info["parents"] == ["root"]
+    client.forget_shortcut("/TeamDrive")
+    assert client.shortcut_info_for_path("/TeamDrive") is None
+
+
+def test_shortcut_info_resolves_after_cache_loss() -> None:
+    """插件重载/缓存丢失后仍能重新识别快捷方式挂载点。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [_shortcut_payload()]}),
+        FakeResponse(payload={"files": [_shortcut_payload()]}),
+    ])
+    client = _client(transport)
+    assert client.get_item("/TeamDrive") is not None
+    client.forget_shortcut("/TeamDrive")
+    info = client.shortcut_info_for_path("/TeamDrive")
+    assert info is not None
+    assert info["id"] == "shortcut-1"
+    assert len(transport.calls) == 2
 
 
 def test_get_item_returns_none_when_missing() -> None:
