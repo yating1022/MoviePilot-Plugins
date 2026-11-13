@@ -92,15 +92,18 @@ class GDriveStorageProvider:
             self,
             client: GoogleDriveClient,
             log: Callable[[str, str, bool, str], None],
+            trace: Optional[Callable[[str], None]] = None,
     ) -> None:
         """
         保存客户端和操作日志回调。
 
         :param client: Google Drive 客户端
         :param log: ``(action, path, ok, detail)`` 日志回调
+        :param trace: 诊断文件日志回调
         """
         self.client = client
         self._log = log
+        self._trace = trace or (lambda _message: None)
 
     # ------------------------------------------------------------------
     # 数据映射
@@ -144,13 +147,21 @@ class GDriveStorageProvider:
         """
         if fileitem.type == "file":
             return [fileitem]
+        self._trace(f"provider.list entry {fileitem.path} fileid={fileitem.fileid}")
         try:
             folder_id = fileitem.fileid or self.client.resolve_folder_id(fileitem.path)
             if not folder_id:
+                self._trace(f"provider.list no-folder {fileitem.path}")
                 return []
-            return [self.to_file_item(item) for item in self.client.list(folder_id, fileitem.path or "/")]
+            result = [
+                self.to_file_item(item)
+                for item in self.client.list(folder_id, fileitem.path or "/")
+            ]
+            self._trace(f"provider.list done {fileitem.path} count={len(result)}")
+            return result
         except (GoogleDriveError, ValueError) as err:
             logger.warning(f"【GDrive】列举目录失败：{fileitem.path} - {err}")
+            self._trace(f"provider.list error {fileitem.path} {err}")
             return []
 
     def list_strict(self, fileitem: FileItem) -> List[FileItem]:
@@ -168,11 +179,14 @@ class GDriveStorageProvider:
 
     def get_item(self, path: Any) -> Optional[FileItem]:
         """按路径查询文件或目录。"""
+        self._trace(f"provider.get_item entry {path}")
         try:
             item = self.client.get_item(path)
         except (GoogleDriveError, ValueError) as err:
             logger.warning(f"【GDrive】查询路径失败：{path} - {err}")
+            self._trace(f"provider.get_item error {path} {err}")
             return None
+        self._trace(f"provider.get_item done {path} -> {item.path if item else 'None'}")
         return self.to_file_item(item) if item else None
 
     def get_item_strict(self, path: Any) -> Optional[FileItem]:
@@ -182,11 +196,20 @@ class GDriveStorageProvider:
         :param path: 对外路径
         :return: 文件项；确认不存在返回 None；API 故障向上抛出
         """
-        item = self.client.get_item(path)
+        self._trace(f"provider.get_item_strict entry {path}")
+        try:
+            item = self.client.get_item(path)
+        except Exception as err:
+            self._trace(f"provider.get_item_strict error {path} {err}")
+            raise
+        self._trace(
+            f"provider.get_item_strict done {path} -> {item.path if item else 'None'}"
+        )
         return self.to_file_item(item) if item else None
 
     def get_folder(self, path: Any, create: bool = True) -> Optional[FileItem]:
         """解析目录，缺失时按需递归创建。"""
+        self._trace(f"provider.get_folder entry {path} create={create}")
         try:
             folder_id = self.client.resolve_folder_id(path, create=create)
             if not folder_id:
@@ -203,6 +226,7 @@ class GDriveStorageProvider:
                 return None
             normalized = GoogleDriveClient.normalize_virtual_path(path)
             name = PurePosixPath(normalized).name or "/"
+            self._trace(f"provider.get_folder synthetic-dir {path} id={folder_id}")
             return FileItem(
                 storage=STORAGE_TYPE,
                 type="dir",
@@ -213,6 +237,7 @@ class GDriveStorageProvider:
             )
         except (GoogleDriveError, ValueError) as err:
             logger.warning(f"【GDrive】获取/创建目录失败：{path} - {err}")
+            self._trace(f"provider.get_folder error {path} {err}")
             return None
 
     def get_parent(self, fileitem: FileItem) -> Optional[FileItem]:
@@ -454,7 +479,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -477,6 +502,7 @@ class GDriveStorage(_PluginBase):
         """初始化线程锁和运行时状态。"""
         super().__init__()
         self._client_lock = threading.RLock()
+        self._trace_lock = threading.Lock()
         self._config = {}
         self._logs = []
         self._last_quota = {}
@@ -494,6 +520,10 @@ class GDriveStorage(_PluginBase):
         self._enabled = bool(cfg.get("enabled"))
         self._display_name = cfg["display_name"]
         self._register_storage = bool(cfg.get("register_storage", True))
+        self._trace(
+            f"init v{self.plugin_version} enabled={self._enabled} "
+            f"root_id={cfg.get('root_folder_id')} root_path={cfg.get('root_path')}"
+        )
         self._page = 1
         stored_logs = self.get_data("logs")
         self._logs = list(stored_logs)[-MAX_LOGS:] if isinstance(stored_logs, list) else []
@@ -501,7 +531,7 @@ class GDriveStorage(_PluginBase):
         self._last_quota = stored_quota if isinstance(stored_quota, dict) else {}
         self._client = self._build_client(cfg)
         self._provider = (
-            GDriveStorageProvider(self._client, self._record_log)
+            GDriveStorageProvider(self._client, self._record_log, self._trace)
             if self._client and cfg.get("refresh_token") else None
         )
         if self._enabled and self._register_storage:
@@ -566,7 +596,7 @@ class GDriveStorage(_PluginBase):
             old = self._client
             self._client = self._build_client(self._config)
             self._provider = (
-                GDriveStorageProvider(self._client, self._record_log)
+                GDriveStorageProvider(self._client, self._record_log, self._trace)
                 if self._client and self._config.get("refresh_token") else None
             )
         if old is not None and old is not self._client:
@@ -762,10 +792,12 @@ class GDriveStorage(_PluginBase):
     def get_folder(self, storage: str, path: Path) -> Optional[FileItem]:
         """获取目录，缺失时创建。"""
         is_gdrive = self._is_gdrive(storage)
-        logger.info(
-            f"【GDrive】get_folder 调用：storage={storage} gdrive={is_gdrive} "
+        diag = (
+            f"get_folder storage={storage} gdrive={is_gdrive} "
             f"thread={threading.current_thread().name} path={path}"
         )
+        self._trace(diag)
+        logger.warning(f"【GDrive】DIAG {diag}")
         if not is_gdrive:
             return None
         provider = self._provider_or_none()
@@ -778,9 +810,14 @@ class GDriveStorage(_PluginBase):
             result = provider.get_folder(path, create=True)
         finally:
             done.set()
+        elapsed = time.monotonic() - started
+        self._trace(
+            f"get_folder done {path} -> {result.path if result else 'None'} "
+            f"elapsed={elapsed:.2f}s"
+        )
         logger.info(
             f"【GDrive】get_folder 完成：{path} -> "
-            f"{result.path if result else 'None'}（{time.monotonic() - started:.2f}s）"
+            f"{result.path if result else 'None'}（{elapsed:.2f}s）"
         )
         return result
 
@@ -835,10 +872,12 @@ class GDriveStorage(_PluginBase):
     def get_file_item(self, storage: str, path: Path) -> Optional[FileItem]:
         """按路径查询文件或目录。"""
         is_gdrive = self._is_gdrive(storage)
-        logger.info(
-            f"【GDrive】get_file_item 调用：storage={storage} gdrive={is_gdrive} "
+        diag = (
+            f"get_file_item storage={storage} gdrive={is_gdrive} "
             f"thread={threading.current_thread().name} path={path}"
         )
+        self._trace(diag)
+        logger.warning(f"【GDrive】DIAG {diag}")
         if not is_gdrive:
             return None
         provider = self._provider_or_none()
@@ -851,19 +890,26 @@ class GDriveStorage(_PluginBase):
             result = provider.get_item(path)
         finally:
             done.set()
+        elapsed = time.monotonic() - started
+        self._trace(
+            f"get_file_item done {path} -> {result.path if result else 'None'} "
+            f"elapsed={elapsed:.2f}s"
+        )
         logger.info(
             f"【GDrive】get_file_item 完成：{path} -> "
-            f"{result.path if result else 'None'}（{time.monotonic() - started:.2f}s）"
+            f"{result.path if result else 'None'}（{elapsed:.2f}s）"
         )
         return result
 
     def get_file_item_strict(self, storage: str, path: Path) -> Optional[FileItemQueryResult]:
         """严格查询文件或目录，返回宿主模块契约要求的查询回执。"""
         is_gdrive = self._is_gdrive(storage)
-        logger.info(
-            f"【GDrive】get_file_item_strict 调用：storage={storage} gdrive={is_gdrive} "
+        diag = (
+            f"get_file_item_strict storage={storage} gdrive={is_gdrive} "
             f"thread={threading.current_thread().name} path={path}"
         )
+        self._trace(diag)
+        logger.warning(f"【GDrive】DIAG {diag}")
         if not is_gdrive:
             return None
         provider = self._provider_or_none()
@@ -876,9 +922,14 @@ class GDriveStorage(_PluginBase):
             item = provider.get_item_strict(path)
         finally:
             done.set()
+        elapsed = time.monotonic() - started
+        self._trace(
+            f"get_file_item_strict done {path} -> {item.path if item else 'None'} "
+            f"elapsed={elapsed:.2f}s"
+        )
         logger.info(
             f"【GDrive】get_file_item_strict 完成：{path} -> "
-            f"{item.path if item else 'None'}（{time.monotonic() - started:.2f}s）"
+            f"{item.path if item else 'None'}（{elapsed:.2f}s）"
         )
         return FileItemQueryResult(item=item)
 
@@ -1340,6 +1391,19 @@ class GDriveStorage(_PluginBase):
     # ------------------------------------------------------------------
     # 日志
     # ------------------------------------------------------------------
+    def _trace(self, message: str) -> None:
+        """把诊断信息追加到插件数据目录，绕开宿主日志级别过滤。"""
+        try:
+            trace_file = self.get_data_path() / "debug_calls.log"
+            with self._trace_lock:
+                with trace_file.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} "
+                        f"[{threading.current_thread().name}] {message}\n"
+                    )
+        except Exception:
+            pass
+
     def _record_log(self, action: str, path: str, ok: bool, detail: str = "") -> None:
         """追加一条操作日志并持久化，最多保留 MAX_LOGS 条。"""
         entry = {
