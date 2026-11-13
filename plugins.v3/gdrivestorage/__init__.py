@@ -59,6 +59,7 @@ FORM_KEYS = (
     "oauth_code",
     "root_folder_id",
     "root_path",
+    "test_path",
     "use_shared_drive",
     "shared_drive_id",
     "delete_mode",
@@ -254,13 +255,23 @@ class GDriveStorageProvider:
         try:
             folder_id = folder.fileid or self.client.resolve_folder_id(folder.path, create=True)
             if not folder_id:
+                message = f"无法解析目标目录 ID：{folder.path}"
+                logger.error(f"【GDrive】上传失败：{path} - {message}")
+                self._log("upload", str(path), False, message)
                 return None
+            logger.info(
+                f"【GDrive】开始上传：{path} -> {folder.path}"
+                f"（目录 ID={folder_id}，大小={Path(path).stat().st_size if Path(path).is_file() else '未知'}）"
+            )
             item = self.client.upload(folder_id, folder.path or "/", Path(path), new_name)
         except (GoogleDriveError, OSError, ValueError) as err:
-            logger.warning(f"【GDrive】上传失败：{path} - {err}")
+            logger.error(f"【GDrive】上传失败：{path} - {err}", exc_info=True)
             self._log("upload", str(path), False, str(err))
             return None
         if not item:
+            message = "Google Drive 未返回上传结果"
+            logger.error(f"【GDrive】上传失败：{path} - {message}")
+            self._log("upload", str(path), False, message)
             return None
         self._log("upload", item.path, True, "")
         return self.to_file_item(item)
@@ -419,7 +430,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -558,6 +569,11 @@ class GDriveStorage(_PluginBase):
         except ValueError:
             logger.warning(f"【GDrive】root_path 无效，回退为 {DEFAULT_ROOT_PATH}")
             root_path = DEFAULT_ROOT_PATH
+        raw_test_path = str(cfg.get("test_path") or "/").strip() or "/"
+        try:
+            test_path = GoogleDriveClient.normalize_virtual_path(raw_test_path)
+        except ValueError:
+            test_path = "/"
         delete_mode = "permanent" if cfg.get("delete_mode") == "permanent" else "trash"
         return {
             "enabled": bool(cfg.get("enabled")),
@@ -570,6 +586,7 @@ class GDriveStorage(_PluginBase):
             "oauth_code": str(cfg.get("oauth_code") or "").strip(),
             "root_folder_id": str(cfg.get("root_folder_id") or "root").strip() or "root",
             "root_path": root_path,
+            "test_path": test_path,
             "use_shared_drive": bool(cfg.get("use_shared_drive")),
             "shared_drive_id": str(cfg.get("shared_drive_id") or "").strip(),
             "delete_mode": delete_mode,
@@ -942,6 +959,13 @@ class GDriveStorage(_PluginBase):
                 "summary": "测试 Google Drive 连接",
             },
             {
+                "path": "/test_upload",
+                "endpoint": self.api_test_upload,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "向测试路径写入再删除一个小文件",
+            },
+            {
                 "path": "/quota",
                 "endpoint": self.api_quota,
                 "methods": ["POST"],
@@ -1022,6 +1046,51 @@ class GDriveStorage(_PluginBase):
                 "available_text": format_size(quota.available),
             },
         }
+
+    def api_test_upload(self) -> Dict[str, Any]:
+        """向测试路径写入一个临时文件并删除，用于验证写权限和上传链路。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用", "data": None}
+        provider = self._provider_or_none()
+        if not provider:
+            return {"success": False, "message": "尚未完成授权", "data": None}
+        target_path = str(self._config.get("test_path") or "/").strip() or "/"
+        temp_file = self.get_data_path() / ".gdrive_write_test"
+        try:
+            temp_file.write_text("moviepilot gdrive write test\n", encoding="utf-8")
+            folder = provider.get_folder(target_path, create=True)
+            if not folder:
+                return {
+                    "success": False,
+                    "message": f"无法获取/创建测试目录：{target_path}",
+                    "data": None,
+                }
+            item = provider.upload(folder, temp_file, ".gdrive_write_test")
+            if not item:
+                failure = next(
+                    (
+                        entry for entry in reversed(self._logs)
+                        if entry.get("action") == "upload" and not entry.get("ok")
+                    ),
+                    None,
+                )
+                detail = (failure or {}).get("detail") or "上传失败，请查看操作日志"
+                return {
+                    "success": False,
+                    "message": f"测试上传失败：{detail}",
+                    "data": {"path": target_path},
+                }
+            provider.delete(item)
+            return {
+                "success": True,
+                "message": f"测试上传成功：{item.path}",
+                "data": {"path": item.path, "fileid": item.fileid},
+            }
+        finally:
+            try:
+                temp_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def api_quota(self) -> Dict[str, Any]:
         """刷新容量并缓存。"""
@@ -1297,6 +1366,16 @@ class GDriveStorage(_PluginBase):
                         ],
                     },
                     {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "test_path",
+                            "label": "测试上传路径",
+                            "placeholder": "/",
+                            "hint": "详情页“测试上传”写入的目录；留空使用根路径，可填团队盘快捷方式下的目录",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
                         "component": "VRow",
                         "content": [
                             {
@@ -1385,6 +1464,7 @@ class GDriveStorage(_PluginBase):
             "oauth_code": "",
             "root_folder_id": "root",
             "root_path": DEFAULT_ROOT_PATH,
+            "test_path": "/",
             "use_shared_drive": False,
             "shared_drive_id": "",
             "delete_mode": DEFAULT_DELETE_MODE,
@@ -1429,9 +1509,24 @@ class GDriveStorage(_PluginBase):
                 f"检查时间 {self._last_quota.get('checked_at') or '-'}。"
             )
         contents.append(self._alert("info", quota_text))
+        latest_upload_failure = next(
+            (
+                entry for entry in reversed(self._logs)
+                if entry.get("action") == "upload" and not entry.get("ok")
+            ),
+            None,
+        )
+        if latest_upload_failure:
+            contents.append(self._alert(
+                "error",
+                f"最近上传失败：{latest_upload_failure.get('time') or '-'} "
+                f"{latest_upload_failure.get('path') or '-'}；"
+                f"原因：{latest_upload_failure.get('detail') or '未知'}",
+            ))
 
         buttons: List[dict] = [
             self._page_button("测试连接", "mdi-connection", "/test"),
+            self._page_button("测试上传", "mdi-cloud-upload", "/test_upload"),
             self._page_button("刷新容量", "mdi-cloud-refresh", "/quota"),
         ]
         auth_url = self._auth_url()

@@ -1004,6 +1004,8 @@ class GoogleDriveClient:
                     auth=False,
                     retry=False,
                     allow_status={308},
+                    # 大文件分片在慢速上行链路需要更长读超时
+                    timeout=max(self.timeout, 300.0),
                 )
             except GoogleDriveError as err:
                 last_error = err
@@ -1047,7 +1049,10 @@ class GoogleDriveClient:
         target = Path(local_dir) / safe_name
         target.parent.mkdir(parents=True, exist_ok=True)
         headers = self._auth_headers()
-        with self._transport.stream("GET", url, headers=headers, params=params) as response:
+        with self._transport.stream(
+            "GET", url, headers=headers, params=params,
+            timeout=max(self.timeout, 300.0),
+        ) as response:
             if response.status_code != 200:
                 raise GoogleDriveError(
                     "Google Drive 下载失败",
@@ -1144,6 +1149,7 @@ class GoogleDriveClient:
             auth: bool = True,
             retry: Optional[bool] = None,
             allow_status: Optional[Iterable[int]] = None,
+            timeout: Optional[float] = None,
     ) -> Any:
         """
         发送一次请求，处理认证、重试和错误映射。
@@ -1158,6 +1164,7 @@ class GoogleDriveClient:
         :param auth: 是否附加 Bearer 头
         :param retry: 是否对 429/5xx 重试；为空时仅对幂等方法重试
         :param allow_status: 允许作为正常结果返回的非 2xx 状态码
+        :param timeout: 本次请求超时；为空时使用客户端默认值
         :return: 成功的响应对象
         """
         request_headers: Dict[str, str] = dict(headers or {})
@@ -1179,7 +1186,7 @@ class GoogleDriveClient:
                     data=dict(data) if data is not None else None,
                     headers=request_headers,
                     content=content,
-                    timeout=self.timeout,
+                    timeout=timeout or self.timeout,
                 )
             except Exception as err:  # 传输层异常（连接、超时、TLS）
                 if should_retry and attempt < MAX_RETRY - 1:
