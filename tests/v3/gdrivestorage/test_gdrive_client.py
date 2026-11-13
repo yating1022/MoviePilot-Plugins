@@ -360,6 +360,45 @@ def test_shortcut_info_tracks_mount_path() -> None:
     assert client.shortcut_info_for_path("/TeamDrive") is None
 
 
+def test_describe_folder_access_reports_missing_and_readonly() -> None:
+    """预检能区分目录不存在/无权限与目录存在但只读。"""
+    missing_transport = FakeTransport([
+        FakeResponse(status_code=404, payload={"error": {"message": "Not Found"}}),
+    ])
+    missing = _client(missing_transport).describe_folder_access("folder-1")
+    assert missing["exists"] is False
+    assert missing["reason"] == "not_found_or_no_access"
+
+    readonly_transport = FakeTransport([
+        FakeResponse(payload={
+            "id": "folder-1",
+            "name": "TeamDrive",
+            "mimeType": client_module.FOLDER_MIME,
+            "capabilities": {"canAddChildren": False, "canEdit": False},
+        }),
+    ])
+    readonly = _client(readonly_transport).describe_folder_access("folder-1")
+    assert readonly["exists"] is True
+    assert readonly["can_add_children"] is False
+
+    shared_drive_transport = FakeTransport([
+        FakeResponse(status_code=404, payload={"error": {"message": "Not Found"}}),
+        FakeResponse(payload={"id": "0AJshared", "name": "Team Drive"}),
+    ])
+    shared_drive = _client(shared_drive_transport).describe_folder_access("0AJshared")
+    assert shared_drive["exists"] is True
+    assert shared_drive["is_shared_drive"] is True
+    assert shared_drive_transport.calls[1]["url"].endswith("/drives/0AJshared")
+
+
+def test_is_mount_root_accepts_slash_and_configured_root() -> None:
+    """虚拟根 "/" 与配置的挂载点根都视为根目录。"""
+    client = _client(FakeTransport([]), root_path="/GDrive")
+    assert client.is_mount_root("/") is True
+    assert client.is_mount_root("/GDrive") is True
+    assert client.is_mount_root("/GDrive/Movies") is False
+
+
 def test_shortcut_info_resolves_after_cache_loss() -> None:
     """插件重载/缓存丢失后仍能重新识别快捷方式挂载点。"""
     transport = FakeTransport([

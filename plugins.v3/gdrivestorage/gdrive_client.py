@@ -537,6 +537,11 @@ class GoogleDriveClient:
         with self._cache_lock:
             self._folder_cache[key] = (folder_id, time.monotonic() + self._cache_ttl)
 
+    @property
+    def root_id(self) -> str:
+        """对外暴露当前配置解析出的根目录 ID。"""
+        return self._root_id()
+
     def _root_id(self) -> str:
         """返回实际可用的根目录 ID。"""
         if self.root_folder_id and self.root_folder_id != "root":
@@ -544,6 +549,12 @@ class GoogleDriveClient:
         if self.use_shared_drive and self.shared_drive_id:
             return self.shared_drive_id
         return self.root_folder_id or "root"
+
+    def is_mount_root(self, path: Any) -> bool:
+        """判断路径是否映射到配置的挂载点根目录。"""
+        virtual = self.normalize_virtual_path(path)
+        root = self.normalize_virtual_path(self.root_path)
+        return virtual in ("/", root)
 
     def resolve_folder_id(self, path: Any, create: bool = False) -> Optional[str]:
         """
@@ -785,6 +796,67 @@ class GoogleDriveClient:
     def detail(self, file_id: str, virtual_path: Optional[str] = None) -> Optional[DriveItem]:
         """按 ID 重新读取详情。"""
         return self.get_item_by_id(file_id, virtual_path)
+
+    def describe_folder_access(self, file_id: str) -> Dict[str, Any]:
+        """
+        查询目录是否存在以及当前账号的写入能力。
+
+        :param file_id: 目录 ID；可以是共享盘 ID/普通文件夹 ID
+        :return: 包含 exists/name/mime_type/can_add_children/can_edit 的字典
+        """
+        if not file_id:
+            return {"exists": False, "reason": "empty_id"}
+        try:
+            response = self._request(
+                "GET",
+                f"{DRIVE_API}/files/{file_id}",
+                params={
+                    "fields": (
+                        "id,name,mimeType,parents,"
+                        "capabilities/canAddChildren,capabilities/canEdit,"
+                        "capabilities/canListChildren"
+                    ),
+                    "supportsAllDrives": "true",
+                },
+            )
+        except GoogleDriveNotFound:
+            # 共享盘 ID 不是 File，files.get 会 404；drives.get 可区分“共享盘存在”
+            try:
+                drive_response = self._request(
+                    "GET",
+                    f"{DRIVE_API}/drives/{file_id}",
+                    params={"fields": "id,name"},
+                )
+            except GoogleDriveError:
+                return {"exists": False, "reason": "not_found_or_no_access", "id": file_id}
+            drive_data = self._json(drive_response)
+            return {
+                "exists": True,
+                "is_shared_drive": True,
+                "id": str(drive_data.get("id") or file_id),
+                "name": drive_data.get("name") or "",
+                "mime_type": FOLDER_MIME,
+                "parents": [],
+                "can_add_children": None,
+                "can_edit": None,
+                "can_list_children": None,
+            }
+        data = self._json(response)
+        caps = data.get("capabilities") or {}
+        can_add = caps.get("canAddChildren")
+        can_edit = caps.get("canEdit")
+        can_list = caps.get("canListChildren")
+        return {
+            "exists": True,
+            "is_shared_drive": False,
+            "id": str(data.get("id") or file_id),
+            "name": data.get("name") or "",
+            "mime_type": data.get("mimeType") or "",
+            "parents": [str(parent) for parent in (data.get("parents") or [])],
+            "can_add_children": bool(can_add) if can_add is not None else None,
+            "can_edit": bool(can_edit) if can_edit is not None else None,
+            "can_list_children": bool(can_list) if can_list is not None else None,
+        }
 
     # ------------------------------------------------------------------
     # 写操作

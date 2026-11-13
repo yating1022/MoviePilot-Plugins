@@ -193,6 +193,13 @@ class GDriveStorageProvider:
             item = self.client.get_item(path)
             if item:
                 return self.to_file_item(item)
+            # 根目录无法访问时不能伪造目录项，否则上传只会得到难懂的 404
+            if self.client.is_mount_root(path):
+                logger.warning(
+                    f"【GDrive】根目录不可访问：{path}（目录 ID={folder_id}），"
+                    "请检查 root_folder_id 或共享盘权限"
+                )
+                return None
             normalized = GoogleDriveClient.normalize_virtual_path(path)
             name = PurePosixPath(normalized).name or "/"
             return FileItem(
@@ -265,8 +272,24 @@ class GDriveStorageProvider:
             )
             item = self.client.upload(folder_id, folder.path or "/", Path(path), new_name)
         except (GoogleDriveError, OSError, ValueError) as err:
-            logger.error(f"【GDrive】上传失败：{path} - {err}", exc_info=True)
-            self._log("upload", str(path), False, str(err))
+            detail = str(err)
+            if getattr(err, "status_code", None) == 404:
+                detail += (
+                    f"；目标目录 ID={folder_id} 不存在或当前账号无权限。"
+                    "若通过团队盘快捷方式访问，请保持 root_folder_id=root，"
+                    "并把目录写到 /快捷方式名/... 下；不要在根目录 ID 填共享盘 ID。"
+                )
+                try:
+                    access = self.client.describe_folder_access(folder_id)
+                    if access.get("is_shared_drive"):
+                        detail += (
+                            " 该 ID 是共享盘 ID，不是共享盘内的文件夹 ID；"
+                            "请改用共享盘内实际文件夹 ID，或使用“我的云端硬盘”里的快捷方式。"
+                        )
+                except Exception:
+                    pass
+            logger.error(f"【GDrive】上传失败：{path} - {detail}", exc_info=True)
+            self._log("upload", str(path), False, detail)
             return None
         if not item:
             message = "Google Drive 未返回上传结果"
@@ -430,7 +453,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -1060,11 +1083,50 @@ class GDriveStorage(_PluginBase):
             temp_file.write_text("moviepilot gdrive write test\n", encoding="utf-8")
             folder = provider.get_folder(target_path, create=True)
             if not folder:
+                extra = ""
+                if self._client and self._client.is_mount_root(target_path):
+                    access = self._client.describe_folder_access(self._client.root_id)
+                    if access.get("is_shared_drive"):
+                        extra = (
+                            f"；根目录 ID={self._client.root_id} 是共享盘 ID，"
+                            "不是共享盘内的文件夹 ID。请改用共享盘内实际文件夹 ID，"
+                            "或保持 root_folder_id=root，把快捷方式放在“我的云端硬盘”，"
+                            "并把测试上传路径写到 /快捷方式名/... 下。"
+                        )
+                    elif not access.get("exists"):
+                        extra = (
+                            f"；根目录 ID={self._client.root_id} 不存在或当前账号无权限。"
+                            "如果使用团队盘快捷方式，请保持 root_folder_id=root，"
+                            "并把测试上传路径写到 /快捷方式名/... 下；"
+                            "不要把共享盘 ID 直接填到根目录 ID。"
+                        )
                 return {
                     "success": False,
-                    "message": f"无法获取/创建测试目录：{target_path}",
+                    "message": f"无法获取/创建测试目录：{target_path}{extra}",
                     "data": None,
                 }
+            if self._client and folder.fileid:
+                access = self._client.describe_folder_access(folder.fileid)
+                if not access.get("exists"):
+                    return {
+                        "success": False,
+                        "message": (
+                            f"目标目录不存在或当前账号无权限：{target_path}"
+                            f"（ID={folder.fileid}）。团队盘快捷方式请确认路径位于 "
+                            "/快捷方式名/... 下，且账号有该目录访问权限。"
+                        ),
+                        "data": {"path": target_path, "fileid": folder.fileid},
+                    }
+                if access.get("can_add_children") is False:
+                    return {
+                        "success": False,
+                        "message": (
+                            f"目标目录存在但当前账号没有写入权限：{target_path}"
+                            f"（ID={folder.fileid}）。请给账号该共享盘/目录的"
+                            "“内容管理者”或等效写入权限。"
+                        ),
+                        "data": {"path": target_path, "fileid": folder.fileid},
+                    }
             item = provider.upload(folder, temp_file, ".gdrive_write_test")
             if not item:
                 failure = next(
