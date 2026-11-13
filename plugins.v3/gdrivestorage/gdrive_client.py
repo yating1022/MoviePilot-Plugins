@@ -808,6 +808,42 @@ class GoogleDriveClient:
         """按 ID 重新读取详情。"""
         return self.get_item_by_id(file_id, virtual_path)
 
+    def create_probe(self, folder_id: str) -> Dict[str, Any]:
+        """
+        在目标目录创建一个零字节元数据文件并删除，验证 files.create 权限。
+
+        该探针不经过上传端点，因此可把“父目录不可写”与“上传初始化失败”区分开。
+
+        :param folder_id: 目标目录 ID
+        :return: 包含 ok/file_id/deleted 的结果
+        :raises GoogleDriveError: 创建失败（权限/目录不存在等）
+        """
+        name = f"gdrive_write_probe_{int(time.time())}.txt"
+        response = self._request(
+            "POST",
+            f"{DRIVE_API}/files",
+            params={"supportsAllDrives": "true", "fields": "id,name"},
+            json={
+                "name": name,
+                "parents": [folder_id],
+                "mimeType": "text/plain",
+            },
+        )
+        data = self._json(response)
+        file_id = str(data.get("id") or "")
+        deleted = False
+        if file_id:
+            try:
+                deleted = self.delete(file_id)
+            except GoogleDriveError:
+                deleted = False
+        return {
+            "ok": bool(file_id),
+            "name": name,
+            "file_id": file_id or None,
+            "deleted": deleted,
+        }
+
     def describe_folder_access(self, file_id: str) -> Dict[str, Any]:
         """
         查询目录是否存在以及当前账号的写入能力。

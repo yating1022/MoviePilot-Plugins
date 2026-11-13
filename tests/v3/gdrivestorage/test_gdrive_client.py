@@ -392,6 +392,23 @@ def test_describe_folder_access_reports_missing_and_readonly() -> None:
     assert shared_drive_transport.calls[1]["url"].endswith("/drives/0AJshared")
 
 
+def test_create_probe_creates_and_deletes_metadata_file() -> None:
+    """目录探针通过 files.create 验证写入权限，并清理探针文件。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"id": "probe-1", "name": "gdrive_write_probe.txt"}),
+        FakeResponse(payload={"id": "probe-1", "trashed": True}),
+    ])
+    result = _client(transport).create_probe("folder-1")
+    assert result["ok"] is True
+    assert result["file_id"] == "probe-1"
+    assert result["deleted"] is True
+    create_call = transport.calls[0]
+    assert create_call["method"] == "POST"
+    assert create_call["url"].endswith("/drive/v3/files")
+    assert create_call["json"]["parents"] == ["folder-1"]
+    assert transport.calls[1]["method"] == "PATCH"
+
+
 def test_is_mount_root_accepts_slash_and_configured_root() -> None:
     """虚拟根 "/" 与配置的挂载点根都视为根目录。"""
     client = _client(FakeTransport([]), root_path="/GDrive")

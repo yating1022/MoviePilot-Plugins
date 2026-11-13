@@ -453,7 +453,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -1128,6 +1128,24 @@ class GDriveStorage(_PluginBase):
                             "“内容管理者”或等效写入权限。"
                         ),
                         "data": {"path": target_path, "fileid": folder.fileid},
+                    }
+                # 先走 files.create 元数据探针，区分“目录不可写”和“上传端点 404”
+                try:
+                    probe = self._client.create_probe(folder.fileid)
+                    access_info["create_probe"] = probe
+                except GoogleDriveError as err:
+                    access_summary = (
+                        f"；目录能力：canAddChildren={access.get('can_add_children')}，"
+                        f"canEdit={access.get('can_edit')}，"
+                        f"isSharedDrive={access.get('is_shared_drive')}"
+                    )
+                    return {
+                        "success": False,
+                        "message": (
+                            f"目录创建测试失败（files.create 返回错误）：{err}"
+                            f"{access_summary}；目录 ID={folder.fileid}"
+                        ),
+                        "data": {"path": target_path, "access": access_info},
                     }
             item = provider.upload(folder, temp_file, ".gdrive_write_test")
             if not item:
