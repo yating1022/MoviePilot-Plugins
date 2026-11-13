@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import mimetypes
 import re
 import threading
@@ -30,9 +31,16 @@ FILE_FIELDS = (
     "id,name,mimeType,parents,size,modifiedTime,createdTime,trashed,"
     "webViewLink,webContentLink,thumbnailLink,md5Checksum,driveId,shortcutDetails"
 )
+# 上传响应只需要稳定字段；避免把 shortcutDetails 等额外字段带到上传初始化
+UPLOAD_FIELDS = (
+    "id,name,mimeType,parents,size,modifiedTime,createdTime,"
+    "webViewLink,thumbnailLink,driveId"
+)
 
 # Google 官方要求可恢复上传分片为 256 KiB 的倍数
 UPLOAD_ALIGN = 256 * 1024
+# 小文件走 multipart，减少可恢复上传初始化的兼容问题；大文件仍走分片
+MULTIPART_THRESHOLD = 10 * 1024 * 1024
 MAX_RETRY = 3
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
 
@@ -231,6 +239,7 @@ class GoogleDriveClient:
             use_shared_drive: bool = False,
             delete_mode: str = "trash",
             chunk_size: int = 8 * 1024 * 1024,
+            multipart_threshold: int = MULTIPART_THRESHOLD,
             timeout: float = 60,
             transport: Optional[HttpTransport] = None,
             cache_ttl: float = 300,
@@ -248,6 +257,7 @@ class GoogleDriveClient:
         :param use_shared_drive: 是否按共享盘列举
         :param delete_mode: ``trash`` 或 ``permanent``
         :param chunk_size: 可恢复上传分片大小（字节）
+        :param multipart_threshold: 小于等于该字节数的文件走 multipart 上传
         :param timeout: HTTP 超时（秒）
         :param transport: 可注入传输层；为空时使用 httpx2
         :param cache_ttl: 路径到 ID 的缓存秒数
@@ -262,6 +272,7 @@ class GoogleDriveClient:
         self.use_shared_drive = bool(use_shared_drive)
         self.delete_mode = "permanent" if delete_mode == "permanent" else "trash"
         self.chunk_size = self._align_chunk_size(chunk_size)
+        self.multipart_threshold = max(0, int(multipart_threshold or 0))
         self.timeout = max(5.0, float(timeout or 60))
         self._transport: HttpTransport = transport or _HttpxTransport(self.timeout)
         self._owns_transport = transport is None
@@ -980,10 +991,14 @@ class GoogleDriveClient:
         name = new_name or path.name
         size = path.stat().st_size
         mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        if size <= self.multipart_threshold:
+            return self._upload_multipart(
+                folder_id, folder_path, path, name, mime_type,
+            )
         init_response = self._request(
             "POST",
             f"{DRIVE_UPLOAD_API}/files",
-            params={"uploadType": "resumable", "supportsAllDrives": "true", "fields": FILE_FIELDS},
+            params={"uploadType": "resumable", "supportsAllDrives": "true", "fields": UPLOAD_FIELDS},
             json={"name": name, "parents": [folder_id]},
             headers={
                 "X-Upload-Content-Type": mime_type,
@@ -1046,6 +1061,52 @@ class GoogleDriveClient:
             self.clear_cache()
             return item
         raise GoogleDriveError("Google Drive 上传未返回完成响应")
+
+    def _upload_multipart(
+            self,
+            folder_id: str,
+            folder_path: str,
+            path: Path,
+            name: str,
+            mime_type: str,
+    ) -> Optional[DriveItem]:
+        """
+        使用 multipart 上传小文件，避免可恢复上传初始化的兼容问题。
+
+        :param folder_id: 目标目录 ID
+        :param folder_path: 目标目录对外路径
+        :param path: 本地文件
+        :param name: 目标文件名
+        :param mime_type: 目标 MIME
+        :return: 上传后的文件项
+        """
+        metadata = json.dumps(
+            {"name": name, "parents": [folder_id]},
+            ensure_ascii=False,
+        )
+        with open(path, "rb") as file:
+            response = self._request(
+                "POST",
+                f"{DRIVE_UPLOAD_API}/files",
+                params={
+                    "uploadType": "multipart",
+                    "supportsAllDrives": "true",
+                    "fields": UPLOAD_FIELDS,
+                },
+                files={
+                    "metadata": (
+                        None,
+                        metadata,
+                        "application/json; charset=UTF-8",
+                    ),
+                    "file": (name, file, mime_type),
+                },
+            )
+        item = self._to_drive_item(
+            self._json(response), self._join_path(folder_path, name)
+        )
+        self.clear_cache()
+        return item
 
     def _upload_chunk(
             self,
@@ -1216,6 +1277,7 @@ class GoogleDriveClient:
             params: Optional[Mapping[str, Any]] = None,
             json: Optional[Mapping[str, Any]] = None,
             data: Optional[Mapping[str, Any]] = None,
+            files: Any = None,
             headers: Optional[Mapping[str, str]] = None,
             content: Any = None,
             auth: bool = True,
@@ -1231,6 +1293,7 @@ class GoogleDriveClient:
         :param params: 查询参数
         :param json: JSON body
         :param data: 表单 body
+        :param files: multipart 文件表单
         :param headers: 额外请求头
         :param content: 原始 body
         :param auth: 是否附加 Bearer 头
@@ -1256,6 +1319,7 @@ class GoogleDriveClient:
                     params=dict(params or {}),
                     json=dict(json) if json is not None else None,
                     data=dict(data) if data is not None else None,
+                    files=files,
                     headers=request_headers,
                     content=content,
                     timeout=timeout or self.timeout,

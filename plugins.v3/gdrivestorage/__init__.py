@@ -453,7 +453,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -1105,8 +1105,10 @@ class GDriveStorage(_PluginBase):
                     "message": f"无法获取/创建测试目录：{target_path}{extra}",
                     "data": None,
                 }
+            access_info: Dict[str, Any] = {}
             if self._client and folder.fileid:
                 access = self._client.describe_folder_access(folder.fileid)
+                access_info = access
                 if not access.get("exists"):
                     return {
                         "success": False,
@@ -1137,10 +1139,17 @@ class GDriveStorage(_PluginBase):
                     None,
                 )
                 detail = (failure or {}).get("detail") or "上传失败，请查看操作日志"
+                access_summary = ""
+                if access_info:
+                    access_summary = (
+                        f"；目录能力：canAddChildren={access_info.get('can_add_children')}，"
+                        f"canEdit={access_info.get('can_edit')}，"
+                        f"isSharedDrive={access_info.get('is_shared_drive')}"
+                    )
                 return {
                     "success": False,
-                    "message": f"测试上传失败：{detail}",
-                    "data": {"path": target_path},
+                    "message": f"测试上传失败：{detail}{access_summary}",
+                    "data": {"path": target_path, "access": access_info},
                 }
             provider.delete(item)
             return {

@@ -120,6 +120,7 @@ def _client(
         "client_secret": "secret",
         "refresh_token": "refresh",
         "transport": transport,
+        "multipart_threshold": 0,
         "sleep": lambda _seconds: None,
     }
     params.update(overrides)
@@ -472,6 +473,23 @@ def test_upload_resumable_chunks(tmp_path: Path) -> None:
     assert transport.calls[0]["headers"]["X-Upload-Content-Length"] == str(300 * 1024)
     assert transport.calls[1]["headers"]["Content-Range"] == f"bytes 0-{256 * 1024 - 1}/{300 * 1024}"
     assert transport.calls[2]["headers"]["Content-Range"].startswith("bytes 262144-")
+
+
+def test_upload_small_file_uses_multipart(tmp_path: Path) -> None:
+    """小文件使用 multipart，避免可恢复上传初始化兼容问题。"""
+    local = tmp_path / "a.mkv"
+    local.write_bytes(b"x" * 29)
+    transport = FakeTransport([
+        FakeResponse(payload=_file_payload("uploaded", "a.mkv", size="29")),
+    ])
+    client = _client(transport, multipart_threshold=10 * 1024 * 1024)
+    item = client.upload("folder-1", "/Movies", local)
+    assert item is not None
+    assert item.id == "uploaded"
+    call = transport.calls[0]
+    assert call["params"]["uploadType"] == "multipart"
+    assert "metadata" in call["files"]
+    assert "file" in call["files"]
 
 
 def test_upload_maps_root_to_mount_point(tmp_path: Path) -> None:
