@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import math
 import mimetypes
 import secrets
@@ -453,7 +454,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -511,7 +512,7 @@ class GDriveStorage(_PluginBase):
             logger.warning("【GDrive】插件已启用，但尚未完成授权，存储暂不可读写")
         elif self._enabled:
             logger.info(
-                f"【GDrive】插件已启用：存储={self._display_name}，"
+                f"【GDrive】插件已启用 v{self.plugin_version}：存储={self._display_name}，"
                 f"根路径={cfg['root_path']}，共享盘={cfg['use_shared_drive']}"
             )
 
@@ -760,14 +761,23 @@ class GDriveStorage(_PluginBase):
 
     def get_folder(self, storage: str, path: Path) -> Optional[FileItem]:
         """获取目录，缺失时创建。"""
-        if not self._is_gdrive(storage):
+        is_gdrive = self._is_gdrive(storage)
+        logger.info(
+            f"【GDrive】get_folder 调用：storage={storage} gdrive={is_gdrive} "
+            f"thread={threading.current_thread().name} path={path}"
+        )
+        if not is_gdrive:
             return None
         provider = self._provider_or_none()
         if not provider:
             return None
         started = time.monotonic()
         logger.info(f"【GDrive】get_folder 开始：{path}")
-        result = provider.get_folder(path, create=True)
+        done = self._stack_watchdog(f"get_folder {path}")
+        try:
+            result = provider.get_folder(path, create=True)
+        finally:
+            done.set()
         logger.info(
             f"【GDrive】get_folder 完成：{path} -> "
             f"{result.path if result else 'None'}（{time.monotonic() - started:.2f}s）"
@@ -807,16 +817,40 @@ class GDriveStorage(_PluginBase):
         provider = self._provider_or_none()
         return provider.rename(fileitem, name) if provider else None
 
+    @staticmethod
+    def _stack_watchdog(label: str, timeout: float = 30.0) -> threading.Event:
+        """查询超过 timeout 秒时打印所有线程堆栈，便于定位卡死位置。"""
+        done = threading.Event()
+
+        def watch() -> None:
+            if not done.wait(timeout):
+                logger.error(
+                    f"【GDrive】{label} 超过 {timeout:g}s，打印线程堆栈以定位卡死点"
+                )
+                faulthandler.dump_traceback(all_threads=True)
+
+        threading.Thread(target=watch, name="GDrive-stack-watch", daemon=True).start()
+        return done
+
     def get_file_item(self, storage: str, path: Path) -> Optional[FileItem]:
         """按路径查询文件或目录。"""
-        if not self._is_gdrive(storage):
+        is_gdrive = self._is_gdrive(storage)
+        logger.info(
+            f"【GDrive】get_file_item 调用：storage={storage} gdrive={is_gdrive} "
+            f"thread={threading.current_thread().name} path={path}"
+        )
+        if not is_gdrive:
             return None
         provider = self._provider_or_none()
         if not provider:
             return None
         started = time.monotonic()
         logger.info(f"【GDrive】get_file_item 开始：{path}")
-        result = provider.get_item(path)
+        done = self._stack_watchdog(f"get_file_item {path}")
+        try:
+            result = provider.get_item(path)
+        finally:
+            done.set()
         logger.info(
             f"【GDrive】get_file_item 完成：{path} -> "
             f"{result.path if result else 'None'}（{time.monotonic() - started:.2f}s）"
@@ -825,14 +859,23 @@ class GDriveStorage(_PluginBase):
 
     def get_file_item_strict(self, storage: str, path: Path) -> Optional[FileItemQueryResult]:
         """严格查询文件或目录，返回宿主模块契约要求的查询回执。"""
-        if not self._is_gdrive(storage):
+        is_gdrive = self._is_gdrive(storage)
+        logger.info(
+            f"【GDrive】get_file_item_strict 调用：storage={storage} gdrive={is_gdrive} "
+            f"thread={threading.current_thread().name} path={path}"
+        )
+        if not is_gdrive:
             return None
         provider = self._provider_or_none()
         if not provider:
             return None
         started = time.monotonic()
         logger.info(f"【GDrive】get_file_item_strict 开始：{path}")
-        item = provider.get_item_strict(path)
+        done = self._stack_watchdog(f"get_file_item_strict {path}")
+        try:
+            item = provider.get_item_strict(path)
+        finally:
+            done.set()
         logger.info(
             f"【GDrive】get_file_item_strict 完成：{path} -> "
             f"{item.path if item else 'None'}（{time.monotonic() - started:.2f}s）"
