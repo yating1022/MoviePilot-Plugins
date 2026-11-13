@@ -502,6 +502,29 @@ def test_upload_resumable_chunks(tmp_path: Path) -> None:
     assert transport.calls[2]["headers"]["Content-Range"].startswith("bytes 262144-")
 
 
+def test_request_preserves_upload_session_query() -> None:
+    """分片 PUT 不能清空会话 URL 自带的 upload_id，否则 Google 返回 404。"""
+    httpx2 = pytest.importorskip("httpx2")
+    seen: List[str] = []
+
+    def handler(request: Any) -> Any:
+        seen.append(str(request.url))
+        return httpx2.Response(200, json={})
+
+    transport = httpx2.Client(transport=httpx2.MockTransport(handler))
+    client = _client(transport)
+    client._request(
+        "PUT",
+        "https://upload.example/session?uploadType=resumable&upload_id=abc",
+        content=b"x",
+        auth=False,
+        retry=False,
+    )
+    assert seen == [
+        "https://upload.example/session?uploadType=resumable&upload_id=abc"
+    ]
+
+
 def test_upload_small_file_uses_multipart(tmp_path: Path) -> None:
     """小文件使用 multipart，避免可恢复上传初始化兼容问题。"""
     local = tmp_path / "a.mkv"

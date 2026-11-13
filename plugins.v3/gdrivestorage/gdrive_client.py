@@ -1362,7 +1362,9 @@ class GoogleDriveClient:
                 response = self._transport.request(
                     method,
                     url,
-                    params=dict(params or {}),
+                    # 必须传 None 而不是空字典：httpx2 收到 params={} 会清空
+                    # 会话 URL 自带的 ?uploadType=resumable&upload_id=...，导致 404
+                    params=dict(params) if params else None,
                     json=dict(json) if json is not None else None,
                     data=dict(data) if data is not None else None,
                     files=files,
