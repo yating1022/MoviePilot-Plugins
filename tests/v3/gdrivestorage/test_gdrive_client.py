@@ -273,6 +273,16 @@ def test_list_uses_shared_drive_corpus_when_configured() -> None:
     assert params["driveId"] == "shared-drive-1"
 
 
+def test_list_rejects_repeated_page_token() -> None:
+    """重复分页令牌必须中止，避免整理队列无限列举。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [], "nextPageToken": "same-token"}),
+        FakeResponse(payload={"files": [], "nextPageToken": "same-token"}),
+    ])
+    with pytest.raises(GoogleDriveError):
+        _client(transport).list("folder-1", "/")
+
+
 def test_get_item_resolves_nested_path() -> None:
     """按路径查询时逐段解析目录并返回文件。"""
     transport = FakeTransport([

@@ -576,6 +576,8 @@ class GoogleDriveClient:
         :return: 文件夹 ID；不存在且不创建时返回 None
         """
         parts = self._relative_parts(path)
+        if len(parts) > 64:
+            raise ValueError("Google Drive 路径层级过深（超过 64 段）")
         if not parts:
             return self._root_id()
         current_id = self._root_id()
@@ -714,7 +716,9 @@ class GoogleDriveClient:
         """
         items: List[DriveItem] = []
         page_token: Optional[str] = None
-        while True:
+        seen_tokens: Set[str] = set()
+        max_pages = 100
+        for _page in range(max_pages):
             params: Dict[str, Any] = {
                 "q": query,
                 "fields": f"nextPageToken,files({FILE_FIELDS})",
@@ -737,10 +741,16 @@ class GoogleDriveClient:
                 if raw.get("trashed"):
                     continue
                 items.append(self._to_drive_item(raw, self._join_path(parent_path, raw.get("name") or "")))
-            page_token = data.get("nextPageToken")
-            if not page_token:
-                break
-        return items
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                return items
+            if next_token in seen_tokens:
+                raise GoogleDriveError("Google Drive 分页令牌重复，已中止列举以避免死循环")
+            seen_tokens.add(str(next_token))
+            page_token = str(next_token)
+        raise GoogleDriveError(
+            f"Google Drive 列举超过 {max_pages} 页，已中止：{query}"
+        )
 
     @staticmethod
     def _escape_query(value: str) -> str:
@@ -1532,6 +1542,9 @@ class GoogleDriveClient:
         details = raw.get("shortcutDetails") or {}
         if depth >= 2:
             fallback_mime = str(details.get("targetMimeType") or "application/octet-stream")
+            # 防止目标仍是快捷方式时 _to_drive_item -> _resolve_shortcut 无限递归
+            if fallback_mime == SHORTCUT_MIME:
+                fallback_mime = "application/octet-stream"
             fallback = {
                 **raw,
                 "id": str(details.get("targetId") or raw.get("id") or ""),

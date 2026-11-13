@@ -453,7 +453,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -763,7 +763,16 @@ class GDriveStorage(_PluginBase):
         if not self._is_gdrive(storage):
             return None
         provider = self._provider_or_none()
-        return provider.get_folder(path, create=True) if provider else None
+        if not provider:
+            return None
+        started = time.monotonic()
+        logger.info(f"【GDrive】get_folder 开始：{path}")
+        result = provider.get_folder(path, create=True)
+        logger.info(
+            f"【GDrive】get_folder 完成：{path} -> "
+            f"{result.path if result else 'None'}（{time.monotonic() - started:.2f}s）"
+        )
+        return result
 
     def download_file(self, fileitem: FileItem, path: Optional[Path] = None) -> Optional[Path]:
         """下载文件到本地。"""
@@ -803,7 +812,16 @@ class GDriveStorage(_PluginBase):
         if not self._is_gdrive(storage):
             return None
         provider = self._provider_or_none()
-        return provider.get_item(path) if provider else None
+        if not provider:
+            return None
+        started = time.monotonic()
+        logger.info(f"【GDrive】get_file_item 开始：{path}")
+        result = provider.get_item(path)
+        logger.info(
+            f"【GDrive】get_file_item 完成：{path} -> "
+            f"{result.path if result else 'None'}（{time.monotonic() - started:.2f}s）"
+        )
+        return result
 
     def get_file_item_strict(self, storage: str, path: Path) -> Optional[FileItemQueryResult]:
         """严格查询文件或目录，返回宿主模块契约要求的查询回执。"""
@@ -812,7 +830,14 @@ class GDriveStorage(_PluginBase):
         provider = self._provider_or_none()
         if not provider:
             return None
-        return FileItemQueryResult(item=provider.get_item_strict(path))
+        started = time.monotonic()
+        logger.info(f"【GDrive】get_file_item_strict 开始：{path}")
+        item = provider.get_item_strict(path)
+        logger.info(
+            f"【GDrive】get_file_item_strict 完成：{path} -> "
+            f"{item.path if item else 'None'}（{time.monotonic() - started:.2f}s）"
+        )
+        return FileItemQueryResult(item=item)
 
     def get_parent_item(self, fileitem: FileItem) -> Optional[FileItem]:
         """获取父目录。"""
