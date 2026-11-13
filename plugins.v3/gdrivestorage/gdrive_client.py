@@ -703,6 +703,10 @@ class GoogleDriveClient:
             if self.use_shared_drive and self.shared_drive_id:
                 params["corpora"] = "drive"
                 params["driveId"] = self.shared_drive_id
+            else:
+                # 未指定共享盘时也搜索共享盘，确保“我的云端硬盘”里的
+                # 团队盘快捷方式目标目录可以正常列举子项
+                params["corpora"] = "allDrives"
             if page_token:
                 params["pageToken"] = page_token
             response = self._request("GET", f"{DRIVE_API}/files", params=params)

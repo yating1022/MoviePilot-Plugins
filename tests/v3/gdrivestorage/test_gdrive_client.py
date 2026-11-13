@@ -254,6 +254,22 @@ def test_list_builds_query_and_maps_item() -> None:
     call = transport.calls[0]
     assert call["params"]["q"] == "'folder-1' in parents and trashed = false"
     assert "files(id,name,mimeType" in call["params"]["fields"]
+    assert call["params"]["corpora"] == "allDrives"
+
+
+def test_list_uses_shared_drive_corpus_when_configured() -> None:
+    """显式配置共享盘时使用 corpora=drive + driveId。"""
+    transport = FakeTransport([
+        FakeResponse(payload={"files": [], "nextPageToken": None}),
+    ])
+    _client(
+        transport,
+        use_shared_drive=True,
+        shared_drive_id="shared-drive-1",
+    ).list("folder-1", "/")
+    params = transport.calls[0]["params"]
+    assert params["corpora"] == "drive"
+    assert params["driveId"] == "shared-drive-1"
 
 
 def test_get_item_resolves_nested_path() -> None:
