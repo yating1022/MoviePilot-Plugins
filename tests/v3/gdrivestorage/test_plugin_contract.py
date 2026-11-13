@@ -487,6 +487,11 @@ def test_storage_oper_selection_only_sets_gdrive_when_ready() -> None:
     plugin.storage_oper_selection(Event(gdrive))
     assert gdrive.storage_oper is provider
 
+    # 参考实现使用显示名作为存储类型；这里两种标识都必须接管
+    display_name = EventData("Google Drive")
+    plugin.storage_oper_selection(Event(display_name))
+    assert display_name.storage_oper is provider
+
     other = EventData("u115")
     plugin.storage_oper_selection(Event(other))
     assert other.storage_oper is None

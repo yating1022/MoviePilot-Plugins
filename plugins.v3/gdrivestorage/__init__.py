@@ -479,7 +479,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -698,7 +698,7 @@ class GDriveStorage(_PluginBase):
         storage = getattr(data, "storage", None)
         if storage is None and isinstance(data, dict):
             storage = data.get("storage")
-        if storage != STORAGE_TYPE:
+        if storage not in {STORAGE_TYPE, self._display_name}:
             return
         try:
             data.storage_oper = self._provider
@@ -724,11 +724,16 @@ class GDriveStorage(_PluginBase):
             "get_parent_item": self.get_parent_item,
             "snapshot_storage": self.snapshot_storage,
             "storage_manage": self.storage_manage,
+            "storage_usage": self.storage_usage,
+            "support_transtype": self.support_transtype,
+            "exists": self.exists,
+            "get_item": self.get_item,
         }
 
     def _is_gdrive(self, storage: Optional[str]) -> bool:
-        """判断存储标识是否为当前插件。"""
-        return (storage or "") == STORAGE_TYPE
+        """判断存储标识是否为当前插件（兼容类型 gdrive 与显示名）。"""
+        value = str(storage or "").strip()
+        return bool(value) and value in {STORAGE_TYPE, self._display_name}
 
     def _provider_or_none(self) -> Optional[GDriveStorageProvider]:
         """返回可用适配器。"""
@@ -950,6 +955,32 @@ class GDriveStorage(_PluginBase):
             return None
         provider = self._provider_or_none()
         return provider.get_parent(fileitem) if provider else None
+
+    def get_item(self, fileitem: FileItem) -> Optional[FileItem]:
+        """兼容旧模块契约：按文件项查询对应云端项。"""
+        if not self._is_gdrive(fileitem.storage):
+            return None
+        provider = self._provider_or_none()
+        return provider.get_item(fileitem.path) if provider else None
+
+    def exists(self, fileitem: FileItem) -> Optional[bool]:
+        """兼容旧模块契约：判断文件项是否存在。"""
+        if not self._is_gdrive(fileitem.storage):
+            return None
+        return self.get_item(fileitem) is not None
+
+    def storage_usage(self, storage: str) -> Optional[StorageUsage]:
+        """兼容旧模块契约：查询容量。"""
+        if not self._is_gdrive(storage):
+            return None
+        provider = self._provider_or_none()
+        return provider.usage() if provider else None
+
+    def support_transtype(self, storage: str) -> Optional[Dict[str, str]]:
+        """兼容旧模块契约：声明支持的整理方式。"""
+        if not self._is_gdrive(storage) or not self._provider:
+            return None
+        return dict(GDriveStorageProvider.transtype)
 
     def snapshot_storage(
             self,
