@@ -479,7 +479,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.9"
+    plugin_version = "1.1.0"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -666,11 +666,13 @@ class GDriveStorage(_PluginBase):
         try:
             helper = StorageHelper()
             existing = helper.get_storage(STORAGE_TYPE)
-            if existing:
-                helper.set_storage(STORAGE_TYPE, existing.config or {})
-            else:
+            if existing is None:
                 helper.add_storage(STORAGE_TYPE, self._display_name, {})
-            logger.info(f"【GDrive】系统存储已注册：{self._display_name}")
+                logger.info(f"【GDrive】系统存储已注册：{self._display_name}")
+            else:
+                # 已有条目时绝不重复写 SystemConfig：宿主即使值未变化也会发布配置变更，
+                # 可能触发 TransferChain 反复 config_reload，阻塞整理任务。
+                logger.debug(f"【GDrive】系统存储已存在，跳过写入：{self._display_name}")
         except Exception as err:
             logger.warning(f"【GDrive】注册系统存储失败：{err}")
 
@@ -797,7 +799,10 @@ class GDriveStorage(_PluginBase):
             f"thread={threading.current_thread().name} path={path}"
         )
         self._trace(diag)
-        logger.warning(f"【GDrive】DIAG {diag}")
+        if is_gdrive:
+            logger.warning(f"【GDrive】DIAG {diag}")
+        else:
+            logger.debug(f"【GDrive】DIAG {diag}")
         if not is_gdrive:
             return None
         provider = self._provider_or_none()
@@ -877,7 +882,10 @@ class GDriveStorage(_PluginBase):
             f"thread={threading.current_thread().name} path={path}"
         )
         self._trace(diag)
-        logger.warning(f"【GDrive】DIAG {diag}")
+        if is_gdrive:
+            logger.warning(f"【GDrive】DIAG {diag}")
+        else:
+            logger.debug(f"【GDrive】DIAG {diag}")
         if not is_gdrive:
             return None
         provider = self._provider_or_none()
@@ -909,7 +917,10 @@ class GDriveStorage(_PluginBase):
             f"thread={threading.current_thread().name} path={path}"
         )
         self._trace(diag)
-        logger.warning(f"【GDrive】DIAG {diag}")
+        if is_gdrive:
+            logger.warning(f"【GDrive】DIAG {diag}")
+        else:
+            logger.debug(f"【GDrive】DIAG {diag}")
         if not is_gdrive:
             return None
         provider = self._provider_or_none()

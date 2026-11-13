@@ -562,7 +562,7 @@ def test_get_page_does_not_raise_in_all_states() -> None:
 
 
 def test_init_plugin_registers_storage_without_authorization() -> None:
-    """启用且开启注册时应在未授权状态下写入系统存储，且不重复追加。"""
+    """启用且开启注册时只新增一次，已有条目时不重复写 SystemConfig。"""
     module = _load_plugin_module()
     _reset_stub_storage()
     plugin = module.GDriveStorage()
@@ -572,7 +572,9 @@ def test_init_plugin_registers_storage_without_authorization() -> None:
     plugin.init_plugin(config)
 
     assert _StubStorageHelper.added == [("gdrive", "GD", {})]
-    assert ("gdrive", {}) in _StubStorageHelper.updated
+    # 已有条目时不能再次 set_storage，否则会发布配置变更并触发整理链重载
+    assert _StubStorageHelper.updated == []
+    assert _StubStorageHelper().get_storage("gdrive") is not None
 
 
 def test_stop_service_is_idempotent_and_closes_client() -> None:
