@@ -479,7 +479,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     plugin_label = "网盘"
     plugin_author = "local"
     plugin_config_prefix = "gdrivestorage_"
@@ -1198,9 +1198,13 @@ class GDriveStorage(_PluginBase):
             return {"success": False, "message": "尚未完成授权", "data": None}
         target_path = str(self._config.get("test_path") or "/").strip() or "/"
         temp_file = self.get_data_path() / ".gdrive_write_test"
+        done = self._stack_watchdog(f"api_test_upload {target_path}", 30.0)
         try:
+            self._diag_step("start", target_path)
             temp_file.write_text("moviepilot gdrive write test\n", encoding="utf-8")
+            self._diag_step("get_folder")
             folder = provider.get_folder(target_path, create=True)
+            self._diag_step("get_folder_done", f"folder={folder.path if folder else None}")
             if not folder:
                 extra = ""
                 if self._client and self._client.is_mount_root(target_path):
@@ -1226,7 +1230,12 @@ class GDriveStorage(_PluginBase):
                 }
             access_info: Dict[str, Any] = {}
             if self._client and folder.fileid:
+                self._diag_step("describe_folder_access", f"id={folder.fileid}")
                 access = self._client.describe_folder_access(folder.fileid)
+                self._diag_step(
+                    "describe_folder_access_done",
+                    f"exists={access.get('exists')} canAdd={access.get('can_add_children')}",
+                )
                 access_info = access
                 if not access.get("exists"):
                     return {
@@ -1250,7 +1259,9 @@ class GDriveStorage(_PluginBase):
                     }
                 # 先走 files.create 元数据探针，区分“目录不可写”和“上传端点 404”
                 try:
+                    self._diag_step("create_probe", f"id={folder.fileid}")
                     probe = self._client.create_probe(folder.fileid)
+                    self._diag_step("create_probe_done", f"ok={probe.get('ok')}")
                     access_info["create_probe"] = probe
                 except GoogleDriveError as err:
                     access_summary = (
@@ -1266,7 +1277,9 @@ class GDriveStorage(_PluginBase):
                         ),
                         "data": {"path": target_path, "access": access_info},
                     }
+            self._diag_step("upload_start")
             item = provider.upload(folder, temp_file, ".gdrive_write_test")
+            self._diag_step("upload_done", f"item={item.path if item else None}")
             if not item:
                 failure = next(
                     (
@@ -1295,6 +1308,7 @@ class GDriveStorage(_PluginBase):
                 "data": {"path": item.path, "fileid": item.fileid},
             }
         finally:
+            done.set()
             try:
                 temp_file.unlink(missing_ok=True)
             except OSError:
@@ -1403,6 +1417,12 @@ class GDriveStorage(_PluginBase):
                     )
         except Exception:
             pass
+
+    def _diag_step(self, step: str, detail: str = "") -> None:
+        """记录测试上传/查询的阶段，确保 WARNING 级别可见。"""
+        message = f"test_upload step={step} {detail}".strip()
+        self._trace(message)
+        logger.warning(f"【GDrive】DIAG {message}")
 
     def _record_log(self, action: str, path: str, ok: bool, detail: str = "") -> None:
         """追加一条操作日志并持久化，最多保留 MAX_LOGS 条。"""
