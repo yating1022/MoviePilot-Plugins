@@ -203,7 +203,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.2.1"
+    plugin_version = "1.2.2"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -264,6 +264,11 @@ class GDriveTree(_PluginBase):
                 f"【GDriveTree】插件已启用 v{self.plugin_version}："
                 f"源插件={self._source_plugin_id}，自动刷新="
                 f"{self._interval_hours}h，包含回收站={self._include_trashed}"
+            )
+            logger.info(
+                f"【GDriveTree】事件通知："
+                f"{'开启' if self._strm_notify else '关闭'}"
+                f"（目标={self._strm_plugin_id}）"
             )
         else:
             logger.debug("【GDriveTree】插件未启用")
@@ -1268,7 +1273,7 @@ class GDriveTree(_PluginBase):
         if not self._enabled:
             return
         if not self._strm_notify:
-            logger.debug("【GDriveTree】未开启「通知 STRM 插件」，跳过事件")
+            logger.info("【GDriveTree】未开启「通知 STRM 插件」，跳过事件通知")
             return
         target = str(self._strm_plugin_id or "").strip()
         if not target:
