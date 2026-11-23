@@ -400,7 +400,7 @@ class U115AutoUpload(_PluginBase):
     plugin_desc = "实时监控本地目录，新文件先探测 115 秒传，重试 x 次后回退普通上传。"
     plugin_version = "1.3.1"
     plugin_label = "网盘"
-    plugin_author = "local"
+    plugin_author = "yating1022"
     plugin_config_prefix = "u115autoupload_"
     plugin_order = 100
     auth_level = 1
