@@ -236,7 +236,9 @@ class GDriveTreeClient:
             file_id=file_id,
             name=str(meta.get("name") or fallback_name or "/"),
             drive_id=drive_id,
-            corpora="drive" if drive_id else "user",
+            # 没有 driveId 时用 allDrives：既覆盖「我的云端硬盘」，也覆盖
+            # 「共享给我」的文件夹和用户可访问的共享盘，避免只抓到根节点。
+            corpora="drive" if drive_id else "allDrives",
         )
 
     def list_all(
@@ -284,6 +286,8 @@ class GDriveTreeClient:
             if corpora == "drive":
                 params["corpora"] = "drive"
                 params["driveId"] = drive_id
+            elif corpora == "allDrives":
+                params["corpora"] = "allDrives"
             else:
                 params["corpora"] = "user"
             if not include_trashed:

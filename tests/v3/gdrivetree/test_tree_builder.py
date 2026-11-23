@@ -136,6 +136,28 @@ def test_multi_parent_second_parent_is_reachable() -> None:
     assert stats.file_count == 1
 
 
+def test_shortcut_folder_is_expanded() -> None:
+    """目录快捷方式把 target 的子项挂到快捷方式下。"""
+    files = [
+        _item(
+            "sc",
+            "Team Folder",
+            SHORTCUT,
+            ["root"],
+            shortcutDetails={"targetId": "T1", "targetMimeType": FOLDER},
+        ),
+        _item("f1", "inside.mkv", "video/x-matroska", ["T1"], size=7),
+    ]
+    nodes, stats = build_tree(files, root_id="root", root_name="root")
+    by_id = {node.file_id: node for node in nodes}
+    assert set(by_id) == {"root", "sc", "f1"}
+    assert by_id["sc"].is_dir is True
+    assert by_id["f1"].parent_file_id == "sc"
+    assert by_id["f1"].path == "/Team Folder/inside.mkv"
+    assert by_id["f1"].depth == 2
+    assert stats.file_count == 1
+
+
 def test_shortcut_folder_target_counts_as_dir() -> None:
     """指向文件夹的快捷方式按目录统计。"""
     files = [

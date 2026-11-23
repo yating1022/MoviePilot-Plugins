@@ -503,6 +503,10 @@ class GDriveTree(_PluginBase):
             self._client = client
             try:
                 root = self._resolve_root(client, source)
+                logger.info(
+                    f"【GDriveTree】根解析：id={root.file_id} name={root.name} "
+                    f"corpora={root.corpora} drive={root.drive_id or '-'}"
+                )
                 files, pages = client.list_all(
                     corpora=root.corpora,
                     drive_id=root.drive_id,
@@ -531,7 +535,8 @@ class GDriveTree(_PluginBase):
             self._save_snapshot(nodes, stats, root, source, pages, duration)
             logger.info(
                 f"【GDriveTree】刷新完成：节点={stats.node_count}，目录="
-                f"{stats.dir_count}，文件={stats.file_count}，耗时={duration:.1f}s"
+                f"{stats.dir_count}，文件={stats.file_count}，拉取元数据="
+                f"{len(files)}，页数={pages}，耗时={duration:.1f}s"
             )
         except GDriveTreeCancelled as err:
             logger.info(f"【GDriveTree】刷新已中止：{err}")

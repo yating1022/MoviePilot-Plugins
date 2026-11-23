@@ -81,7 +81,7 @@ class RootInfo:
 1. `root_folder_id` 为 `root` / 空：`GET /files/root?fields=id,name` 得到真实 ID。
 2. 否则 `get_file(root_id)`。
 3. 若 `mimeType == application/vnd.google-apps.shortcut`，取 `shortcutDetails.targetId` 后再次 `get_file`。
-4. 若最新元数据有 `driveId`：`corpora="drive"`、`drive_id=<driveId>`；否则 `corpora="user"`。
+4. 若最新元数据有 `driveId`：`corpora="drive"`、`drive_id=<driveId>`；否则 `corpora="allDrives"`（覆盖「共享给我」文件夹与可访问共享盘，避免只抓到根节点）。
 5. 根名优先取元数据 `name`；元数据缺失时用 `GDriveStorage.root_path` 的末段或 `/`。
 
 ### 3.4 分页
@@ -168,7 +168,7 @@ def build_tree(
 - `depth = parent.depth + 1`；`max_depth` 取最大深度。
 - `is_dir = mimeType == application/vnd.google-apps.folder`。
 - `size` 缺失/非法按 0；`modifiedTime`/`createdTime` 用 `datetime.fromisoformat` 容错，转 Unix 秒。
-- 快捷方式：保留为普通节点，`shortcut_target_id` 填 `shortcutDetails.targetId`；当 `shortcutDetails.targetMimeType` 是文件夹时 `is_dir=True`（只影响统计/展示，不展开目标子树）。
+- 快捷方式：保留为普通节点，`shortcut_target_id` 填 `shortcutDetails.targetId`；当 `shortcutDetails.targetMimeType` 是文件夹（或 target 有子项）时 `is_dir=True`，并以 `targetId` 作为子项查找键展开，子节点的 `parent_file_id` 仍指向快捷方式本身。
 - `node_count > max_nodes` → 抛 `GDriveTreeError`，由编排层中止。
 - 统计：`dir_count` 含根节点；`file_count` 为文件数；`total_size` 只累加文件。
 - 结果按 `(depth, path)` 排序，保证入库顺序稳定、便于分页。

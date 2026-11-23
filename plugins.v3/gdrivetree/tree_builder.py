@@ -176,10 +176,15 @@ def build_tree(
     stats = TreeStats(node_count=1, dir_count=1)
 
     visited = {root_id}
-    queue: deque[Tuple[str, str, int]] = deque([(root_id, normalized_root, 0)])
+    # 队列项：(用于查子项的 ID, 展示父节点 ID, 父路径, 父深度)
+    # 普通目录的查找 ID 就是自身；目录快捷方式使用 targetId 查子项，
+    # 但展示父节点仍是快捷方式本身。
+    queue: deque[Tuple[str, Optional[str], str, int]] = deque(
+        [(root_id, root_id, normalized_root, 0)]
+    )
     while queue:
-        parent_id, parent_path, parent_depth = queue.popleft()
-        for raw in children.get(parent_id, []):
+        lookup_id, display_parent_id, parent_path, parent_depth = queue.popleft()
+        for raw in children.get(lookup_id, []):
             file_id = str(raw.get("id") or "")
             if not file_id or file_id in visited:
                 continue
@@ -192,12 +197,17 @@ def build_tree(
             if mime_type == SHORTCUT_MIME:
                 details = raw.get("shortcutDetails") or {}
                 shortcut_target = str(details.get("targetId") or "")
-                shortcut_is_dir = str(details.get("targetMimeType") or "") == FOLDER_MIME
+                target_mime = str(details.get("targetMimeType") or "")
+                if not target_mime:
+                    target_mime = str((by_id.get(shortcut_target) or {}).get("mimeType") or "")
+                shortcut_is_dir = target_mime == FOLDER_MIME or bool(
+                    children.get(shortcut_target)
+                )
             is_dir = mime_type == FOLDER_MIME or shortcut_is_dir
             size = 0 if (is_dir or _is_native_doc(mime_type)) else _parse_size(raw.get("size"))
             node = TreeNodeData(
                 file_id=file_id,
-                parent_file_id=parent_id,
+                parent_file_id=display_parent_id,
                 name=name,
                 mime_type=mime_type,
                 is_dir=is_dir,
@@ -212,7 +222,8 @@ def build_tree(
             )
             nodes.append(node)
             if is_dir:
-                queue.append((file_id, node.path, depth))
+                expand_id = shortcut_target if shortcut_target else file_id
+                queue.append((expand_id, file_id, node.path, depth))
             if len(nodes) > max_nodes:
                 raise GDriveTreeBuildError(
                     f"目录树节点数超过上限 {max_nodes}，已中止；"

@@ -19,7 +19,8 @@ Drive 查询语言只有 `'<id>' in parents`，它匹配**直接子项**，没�
 
 | 范围 | 参数 | 说明 |
 | --- | --- | --- |
-| 我的云端硬盘 | `corpora=user` | 默认，不含共享盘内容 |
+| 我的云端硬盘 | `corpora=user` | 不含共享盘内容，且可能漏掉「共享给我」文件夹 |
+| 我的云端硬盘 + 全部可访问共享盘 | `corpora=allDrives` | 无 driveId 时的默认，覆盖最广 |
 | 指定共享盘 | `corpora=drive&driveId=<id>` | 覆盖该共享盘内用户可见文件 |
 | 全部共享盘 | `corpora=allDrives` | 可能很大，gdrivestorage 列举时采用 |
 
@@ -38,7 +39,7 @@ Drive 查询语言只有 `'<id>' in parents`，它匹配**直接子项**，没�
 
 1. `GET /drive/v3/files/{root_id}?fields=id,name,mimeType,driveId,parents,shortcutDetails,supportsAllDrives=true`。
 2. 若是快捷方式，取 `shortcutDetails.targetId`，再次 GET。
-3. 若元数据有 `driveId`，用 `corpora=drive&driveId=<driveId>`；否则 `corpora=user`。
+3. 若元数据有 `driveId`，用 `corpora=drive&driveId=<driveId>`；否则 `corpora=allDrives`（只抓根节点/漏文件的常见原因就是误用 `corpora=user`）。
 4. `root` 别名先 `GET /drive/v3/files/root?fields=id` 换成真实 ID。
 5. 拉取全量后从根 ID 按 `parents` 做 BFS，只保留可达节点。
 

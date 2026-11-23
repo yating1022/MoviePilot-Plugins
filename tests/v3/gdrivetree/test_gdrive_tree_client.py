@@ -104,7 +104,7 @@ def test_resolve_root_alias() -> None:
     ])
     root = _make_client(transport).resolve_root("root")
     assert root.file_id == "REALROOT"
-    assert root.corpora == "user"
+    assert root.corpora == "allDrives"
     assert root.drive_id == ""
     assert transport.calls[1]["url"].endswith("/files/root")
 
@@ -178,6 +178,18 @@ def test_list_all_drive_corpora() -> None:
     params = transport.calls[1]["params"]
     assert params["corpora"] == "drive"
     assert params["driveId"] == "D1"
+
+
+def test_list_all_all_drives_corpora() -> None:
+    """allDrives 模式同时覆盖我的云端硬盘与共享盘。"""
+    transport = FakeTransport([
+        _token(),
+        FakeResponse(payload={"files": []}),
+    ])
+    _make_client(transport).list_all(corpora="allDrives")
+    params = transport.calls[1]["params"]
+    assert params["corpora"] == "allDrives"
+    assert "driveId" not in params
 
 
 def test_list_all_rejects_duplicate_token() -> None:
