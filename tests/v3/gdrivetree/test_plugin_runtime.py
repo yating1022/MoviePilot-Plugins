@@ -232,14 +232,20 @@ def _save(module: Any, instance: Any) -> Any:
     return stats
 
 
-def _save_files(module: Any, instance: Any, files: List[Dict[str, Any]]) -> Any:
+def _save_files(
+    module: Any,
+    instance: Any,
+    files: List[Dict[str, Any]],
+    *,
+    root_path: str = "/",
+) -> Any:
     """把指定文件元数据写入快照并返回变更集。"""
     nodes, stats = module.build_tree(
-        files, root_id="root", root_name="Root", root_path="/"
+        files, root_id="root", root_name="Root", root_path=root_path
     )
     root = module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
     return instance._save_snapshot(
-        nodes, stats, root, {"root_path": "/"}, 1, 0.1
+        nodes, stats, root, {"root_path": root_path}, 1, 0.1
     )
 
 
@@ -680,6 +686,68 @@ def test_archive_event_falls_back_to_tree_path_for_shortcut(
     assert row is not None
     assert row.path == "/Shared/Shows/a.mkv"
     assert row.parent_file_id == "d2"
+    assert link is not None and link.status == "done"
+
+
+def test_archive_event_creates_missing_parent_dirs(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """父目录尚未入树时，按路径逐段补建缺失目录直到目标文件。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {
+            "id": "sc",
+            "name": "媒体库",
+            "mimeType": SHORTCUT,
+            "parents": ["root"],
+            "shortcutDetails": {"targetId": "td", "targetMimeType": FOLDER},
+        },
+    ]
+    _save_files(plugin_module, instance, seed, root_path="/workspace/")
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "sc": {
+            "id": "sc",
+            "name": "媒体库",
+            "mimeType": SHORTCUT,
+            "parents": ["root"],
+            "shortcutDetails": {"targetId": "td", "targetMimeType": FOLDER},
+        },
+        "td": {"id": "td", "name": "Target", "mimeType": FOLDER, "parents": []},
+        "tv": {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["td"]},
+        "s1": {"id": "s1", "name": "Season 1", "mimeType": FOLDER, "parents": ["tv"]},
+        "f-new": {
+            "id": "f-new",
+            "name": "a.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["s1"],
+            "size": "10",
+        },
+    }
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target(
+        "f-new", "/workspace/媒体库/电视剧/Season 1/a.mkv", 44
+    )
+    with instance._session() as session:
+        rows = {
+            row.file_id: row
+            for row in session.scalars(select(plugin_module.TreeNode))
+        }
+        link = session.scalar(
+            select(plugin_module.ArchiveLink).where(
+                plugin_module.ArchiveLink.history_id == 44
+            )
+        )
+    assert rows["tv"].path == "/workspace/媒体库/电视剧/"
+    assert rows["tv"].parent_file_id == "sc"
+    assert rows["s1"].path == "/workspace/媒体库/电视剧/Season 1/"
+    assert rows["s1"].parent_file_id == "tv"
+    assert rows["f-new"].path == "/workspace/媒体库/电视剧/Season 1/a.mkv"
+    assert rows["f-new"].parent_file_id == "s1"
     assert link is not None and link.status == "done"
 
 
