@@ -1,0 +1,440 @@
+"""GDriveTree 实例级测试：用最小宿主桩 + SQLite 内存库验证刷新与查询。"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import types
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from sqlalchemy.pool import StaticPool
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PLUGIN_DIR = REPO_ROOT / "plugins.v3" / "gdrivetree"
+PLUGIN_PATH = PLUGIN_DIR / "__init__.py"
+PACKAGE_NAME = "gdrivetree_plugin_under_test"
+FOLDER = "application/vnd.google-apps.folder"
+STUB_NAMES = (
+    "app",
+    "app.sdk",
+    "app.sdk.database",
+    "app.sdk.logging",
+    "app.sdk.plugin",
+)
+
+
+class _StubLogger:
+    """吞掉日志的宿主 logger 替身。"""
+
+    def debug(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    info = debug
+    warning = debug
+    error = debug
+    exception = debug
+
+
+class _StubDatabase:
+    """插件自有数据库句柄的最小替身。"""
+
+    def __init__(self) -> None:
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
+
+    def session(self):
+        """新建会话。"""
+        return self.session_factory()
+
+
+class _StubPluginBase:
+    """宿主 _PluginBase 的最小替身。"""
+
+    def __init__(self) -> None:
+        self._configs: Dict[str, Any] = {}
+        self._database = _StubDatabase()
+        self._data: Dict[str, Any] = {}
+
+    def get_config(self, plugin_id: Optional[str] = None) -> Any:
+        """返回预设的插件配置。"""
+        return self._configs.get(plugin_id or self.__class__.__name__)
+
+    def update_config(self, config: Dict[str, Any], plugin_id: Optional[str] = None) -> bool:
+        """模拟配置保存。"""
+        self._configs[plugin_id or self.__class__.__name__] = dict(config)
+        return True
+
+    def get_database(self, plugin_id: Optional[str] = None) -> _StubDatabase:
+        """返回实例库。"""
+        return self._database
+
+    def save_data(self, key: str, value: Any, plugin_id: Optional[str] = None) -> None:
+        """模拟插件数据保存。"""
+        self._data[key] = value
+
+    def get_data(self, key: Optional[str] = None, plugin_id: Optional[str] = None) -> Any:
+        """模拟插件数据读取。"""
+        return self._data.get(key) if key else dict(self._data)
+
+    def del_data(self, key: str, plugin_id: Optional[str] = None) -> Any:
+        """模拟插件数据删除。"""
+        return self._data.pop(key, None)
+
+
+def _declarative_base() -> type[DeclarativeBase]:
+    """构造独立的声明式基类。"""
+
+    class Base(DeclarativeBase):
+        pass
+
+    return Base
+
+
+def _install_stubs() -> None:
+    """在 sys.modules 中安装 app.* 桩。"""
+    app = types.ModuleType("app")
+    sdk = types.ModuleType("app.sdk")
+    database = types.ModuleType("app.sdk.database")
+    logging_module = types.ModuleType("app.sdk.logging")
+    plugin_module = types.ModuleType("app.sdk.plugin")
+    database.plugin_declarative_base = _declarative_base
+    logging_module.logger = _StubLogger()
+    plugin_module._PluginBase = _StubPluginBase
+    sdk.database = database
+    sdk.logging = logging_module
+    sdk.plugin = plugin_module
+    app.sdk = sdk
+    sys.modules.update({
+        "app": app,
+        "app.sdk": sdk,
+        "app.sdk.database": database,
+        "app.sdk.logging": logging_module,
+        "app.sdk.plugin": plugin_module,
+    })
+
+
+@pytest.fixture(scope="module")
+def plugin_module():
+    """加载插件包并恢复宿主模块。"""
+    saved = {name: sys.modules.get(name) for name in STUB_NAMES + (PACKAGE_NAME,)}
+    _install_stubs()
+    try:
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE_NAME,
+            PLUGIN_PATH,
+            submodule_search_locations=[str(PLUGIN_DIR)],
+        )
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[PACKAGE_NAME] = module
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
+def _new_plugin(module: Any, config: Optional[Dict[str, Any]] = None) -> Any:
+    """创建实例、建表并写入源插件配置。"""
+    instance = module.GDriveTree()
+    instance.init_plugin(config or {"enabled": True})
+    module.TreeMeta.metadata.create_all(instance._database.engine)
+    instance._configs["GDriveStorage"] = {
+        "client_id": "cid",
+        "client_secret": "secret",
+        "refresh_token": "refresh",
+        "root_folder_id": "root",
+        "root_path": "/",
+        "use_shared_drive": False,
+        "shared_drive_id": "",
+    }
+    return instance
+
+
+def _sample_files() -> List[Dict[str, Any]]:
+    """构造一棵简单目录树。"""
+    return [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "d1", "name": "Movies", "mimeType": FOLDER, "parents": ["root"]},
+        {
+            "id": "f1",
+            "name": "a.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["d1"],
+            "size": "10",
+        },
+    ]
+
+
+def _save(module: Any, instance: Any) -> Any:
+    """把样例树写入快照。"""
+    nodes, stats = module.build_tree(
+        _sample_files(), root_id="root", root_name="Root", root_path="/"
+    )
+    root = module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
+    instance._save_snapshot(nodes, stats, root, {"root_path": "/"}, 1, 0.2)
+    return stats
+
+
+def test_snapshot_persists_and_meta_updates(plugin_module: Any) -> None:
+    """快照写入后节点可查、统计正确。"""
+    instance = _new_plugin(plugin_module)
+    stats = _save(plugin_module, instance)
+    page, pages, total, items = instance._page_nodes(1)
+    assert (page, pages, total) == (1, 1, stats.node_count)
+    assert {item["name"] for item in items} == {"Root", "Movies", "a.mkv"}
+    meta = instance._load_meta()
+    assert meta["status"] == "success"
+    assert meta["node_count"] == stats.node_count
+    assert meta["dir_count"] == 2
+    assert meta["file_count"] == 1
+    assert meta["total_size"] == 10
+
+
+def test_search_filters_name_and_path(plugin_module: Any) -> None:
+    """搜索同时匹配名称和路径。"""
+    instance = _new_plugin(plugin_module)
+    _save(plugin_module, instance)
+    _, _, total, items = instance._page_nodes(1, "Movies")
+    assert total == 2  # Movies 目录 + 其下 a.mkv 的路径
+    _, _, total2, _ = instance._page_nodes(1, "a.mkv")
+    assert total2 == 1
+
+
+def test_failed_refresh_keeps_previous_nodes(plugin_module: Any) -> None:
+    """失败只更新状态，不删除旧节点。"""
+    instance = _new_plugin(plugin_module)
+    _save(plugin_module, instance)
+    instance._safe_failed("failed", "boom")
+    _, _, total, _ = instance._page_nodes(1)
+    assert total == 3
+    meta = instance._load_meta()
+    assert meta["status"] == "failed"
+    assert meta["error"] == "boom"
+
+
+def test_clear_removes_nodes(plugin_module: Any) -> None:
+    """清空操作删除节点并重置统计。"""
+    instance = _new_plugin(plugin_module)
+    _save(plugin_module, instance)
+    result = instance.api_clear()
+    assert set(result) == {"success", "message", "data"}
+    assert result["data"]["deleted"] == 3
+    _, _, total, _ = instance._page_nodes(1)
+    assert total == 0
+    assert instance._load_meta()["status"] == "idle"
+
+
+def test_api_envelopes_are_three_keys(plugin_module: Any) -> None:
+    """页面 API 返回恰好三键；刷新接口用未启用实例避免真实线程。"""
+    instance = _new_plugin(plugin_module)
+    assert set(instance.api_status()) == {"success", "message", "data"}
+    assert set(instance.api_nodes_page({"page": 1})) == {"success", "message", "data"}
+    assert set(instance.api_search({"keyword": "x"})) == {"success", "message", "data"}
+    disabled = _new_plugin(plugin_module, {"enabled": False})
+    assert set(disabled.api_refresh()) == {"success", "message", "data"}
+
+
+def test_extract_drive_id_variants(plugin_module: Any) -> None:
+    """分享链接、共享盘 URL 与纯 ID 都能归一化。"""
+    extract = plugin_module._extract_drive_id
+    assert extract("abcDEF_123") == "abcDEF_123"
+    assert extract("root") == "root"
+    assert extract("https://drive.google.com/drive/folders/ABC123?usp=sharing") == "ABC123"
+    assert extract("https://drive.google.com/open?id=XYZ789") == "XYZ789"
+    assert extract("https://drive.google.com/file/d/FILE001/view") == "FILE001"
+    assert extract("") == ""
+
+
+def test_get_service_respects_switches(plugin_module: Any) -> None:
+    """定时服务仅在启用且开启自动刷新时注册。"""
+    disabled = _new_plugin(plugin_module, {"enabled": False, "auto_refresh": True})
+    assert disabled.get_service() == []
+    no_auto = _new_plugin(plugin_module, {"enabled": True, "auto_refresh": False})
+    assert no_auto.get_service() == []
+    enabled = _new_plugin(
+        plugin_module,
+        {"enabled": True, "auto_refresh": True, "refresh_interval_hours": 6},
+    )
+    services = enabled.get_service()
+    assert services and services[0]["kwargs"]["seconds"] == 6 * 3600
+
+
+def test_start_refresh_requires_enabled(plugin_module: Any) -> None:
+    """未启用时不允许启动刷新。"""
+    instance = _new_plugin(plugin_module, {"enabled": False})
+    assert instance.start_refresh() is False
+
+
+class _FakeClient:
+    """替换真实客户端的替身。"""
+
+    fail = False
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    def resolve_root(self, root_id: str, fallback_name: str = "") -> Any:
+        return _FakeClient.root_info
+
+    def list_all(self, **kwargs: Any) -> Any:
+        if _FakeClient.fail:
+            raise _FakeClient.error
+        return _sample_files(), 1
+
+    def close(self) -> None:
+        pass
+
+
+_FakeClient.root_info = None
+_FakeClient.error = None
+
+
+def test_full_refresh_orchestration(plugin_module: Any, monkeypatch: Any) -> None:
+    """后台刷新走完整编排并成功入库。"""
+    instance = _new_plugin(plugin_module)
+    _FakeClient.fail = False
+    _FakeClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="user"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeClient)
+    assert instance.start_refresh() is True
+    instance._thread.join(timeout=5)
+    meta = instance._load_meta()
+    assert meta["status"] == "success"
+    assert meta["node_count"] == 3
+    assert meta["page_count"] == 1
+
+
+def test_full_refresh_failure_keeps_nodes(plugin_module: Any, monkeypatch: Any) -> None:
+    """客户端失败时状态为 failed，旧节点保留。"""
+    instance = _new_plugin(plugin_module)
+    _save(plugin_module, instance)
+    _FakeClient.fail = True
+    _FakeClient.error = plugin_module.GDriveTreeError("network down")
+    _FakeClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="user"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeClient)
+    assert instance.start_refresh() is True
+    instance._thread.join(timeout=5)
+    meta = instance._load_meta()
+    assert meta["status"] == "failed"
+    assert "network down" in meta["error"]
+    _, _, total, _ = instance._page_nodes(1)
+    assert total == 3
+
+
+def test_cancelled_refresh_keeps_nodes(plugin_module: Any, monkeypatch: Any) -> None:
+    """取消刷新时状态为 cancelled，旧节点保留。"""
+    instance = _new_plugin(plugin_module)
+    _save(plugin_module, instance)
+    _FakeClient.fail = True
+    _FakeClient.error = plugin_module.GDriveTreeCancelled("stopped")
+    _FakeClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="user"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeClient)
+    assert instance.start_refresh() is True
+    instance._thread.join(timeout=5)
+    meta = instance._load_meta()
+    assert meta["status"] == "cancelled"
+    _, _, total, _ = instance._page_nodes(1)
+    assert total == 3
+
+
+def test_missing_source_config_fails(plugin_module: Any) -> None:
+    """源插件配置缺失时状态为 failed。"""
+    instance = _new_plugin(plugin_module)
+    instance._configs.pop("GDriveStorage", None)
+    assert instance.start_refresh() is True
+    instance._thread.join(timeout=5)
+    meta = instance._load_meta()
+    assert meta["status"] == "failed"
+    assert "未找到插件" in meta["error"]
+
+
+def test_source_config_normalizes_share_links(plugin_module: Any) -> None:
+    """共享链接在读取源配置时被归一化为纯 ID。"""
+    instance = _new_plugin(plugin_module)
+    instance._configs["GDriveStorage"].update({
+        "root_folder_id": "https://drive.google.com/drive/folders/FOLDER123?usp=sharing",
+        "shared_drive_id": "https://drive.google.com/drive/folders/DRIVE456",
+    })
+    source = instance._read_source_config()
+    assert source["root_folder_id"] == "FOLDER123"
+    assert source["shared_drive_id"] == "DRIVE456"
+
+
+def test_page_number_is_corrected(plugin_module: Any) -> None:
+    """页码超过总页数时回退到最后一页。"""
+    instance = _new_plugin(plugin_module)
+    files = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+    ] + [
+        {
+            "id": f"f{index}",
+            "name": f"file-{index:02d}.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["root"],
+            "size": "1",
+        }
+        for index in range(25)
+    ]
+    nodes, stats = plugin_module.build_tree(
+        files, root_id="root", root_name="Root", root_path="/"
+    )
+    root = plugin_module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
+    instance._save_snapshot(nodes, stats, root, {"root_path": "/"}, 1, 0.1)
+    page, pages, total, items = instance._page_nodes(99)
+    assert pages == 2
+    assert page == 2
+    assert total == 26
+    assert len(items) == 6
+
+
+def test_like_wildcards_are_escaped(plugin_module: Any) -> None:
+    """搜索关键字中的 % 和 _ 不作为通配符。"""
+    instance = _new_plugin(plugin_module)
+    files = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {
+            "id": "f1",
+            "name": "100%_done.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["root"],
+            "size": "1",
+        },
+    ]
+    nodes, stats = plugin_module.build_tree(
+        files, root_id="root", root_name="Root", root_path="/"
+    )
+    root = plugin_module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
+    instance._save_snapshot(nodes, stats, root, {"root_path": "/"}, 1, 0.1)
+    _, _, exact, _ = instance._page_nodes(1, "100%_done")
+    assert exact == 1
+    _, _, wildcard, _ = instance._page_nodes(1, "100%x")
+    assert wildcard == 0
+
+
+def test_clear_rejected_while_refreshing(plugin_module: Any) -> None:
+    """刷新进行中拒绝清空。"""
+    instance = _new_plugin(plugin_module)
+    assert instance._refresh_lock.acquire(blocking=False)
+    try:
+        result = instance.api_clear()
+    finally:
+        instance._refresh_lock.release()
+    assert result["success"] is False
+    assert "刷新进行中" in result["message"]

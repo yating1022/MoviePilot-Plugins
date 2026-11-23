@@ -46,5 +46,18 @@
       "v1.0.1": "修复配置表单布局，补充间隔字段提示。",
       "v1.0.0": "初始版本：目录监控、115 秒传多次探测、普通上传回退。"
     }
+  },
+  "GDriveTree": {
+    "name": "Google Drive 目录树",
+    "description": "复用 Google Drive 存储插件的授权配置，一次性分页拉取文件元数据并在本地按根目录裁剪建树，目录树持久化到插件自有数据库，支持手动与定时刷新、分页浏览和搜索。",
+    "labels": "网盘",
+    "version": "1.0.0",
+    "icon": "gdrive.png",
+    "author": "yating1022",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "初始版本：复用 GDriveStorage 配置，files.list 全量拉取后按根目录裁剪建树，插件自有 tree_node/tree_meta 表，支持手动/定时刷新、分页浏览、搜索与清空。"
+    }
   }
 }
