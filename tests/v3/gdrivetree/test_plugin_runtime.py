@@ -34,10 +34,14 @@ class _StubEventType:
     """宿主 EventType 的最小替身。"""
 
     TransferComplete = "transfer.complete"
+    PluginTriggered = "plugin.triggered"
 
 
 class _StubEventManager:
-    """宿主 eventmanager 的最小替身。"""
+    """宿主 eventmanager 的最小替身，记录已发送事件。"""
+
+    def __init__(self) -> None:
+        self.events: List[Any] = []
 
     def register(self, *args: Any, **kwargs: Any):
         """返回保持原函数不变的装饰器。"""
@@ -46,6 +50,10 @@ class _StubEventManager:
             return func
 
         return decorator
+
+    def send_event(self, etype: Any, data: Any = None, priority: Any = None) -> None:
+        """记录广播事件。"""
+        self.events.append((etype, data))
 
 
 class _StubLogger:
@@ -218,6 +226,17 @@ def _save(module: Any, instance: Any) -> Any:
     root = module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
     instance._save_snapshot(nodes, stats, root, {"root_path": "/"}, 1, 0.2)
     return stats
+
+
+def _save_files(module: Any, instance: Any, files: List[Dict[str, Any]]) -> Any:
+    """把指定文件元数据写入快照并返回变更集。"""
+    nodes, stats = module.build_tree(
+        files, root_id="root", root_name="Root", root_path="/"
+    )
+    root = module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
+    return instance._save_snapshot(
+        nodes, stats, root, {"root_path": "/"}, 1, 0.1
+    )
 
 
 def test_snapshot_persists_and_meta_updates(plugin_module: Any) -> None:
@@ -668,3 +687,105 @@ def test_archive_scan_records_failure(plugin_module: Any, monkeypatch: Any) -> N
         )
     assert link.status == "failed"
     assert link.retry_count == 1
+
+
+def test_refresh_publishes_targeted_tree_event(plugin_module: Any) -> None:
+    """开启通知后，刷新写库成功会向目标插件发送 tree.changed。"""
+    instance = _new_plugin(
+        plugin_module,
+        {"enabled": True, "strm_notify": True, "strm_plugin_id": "GDriveStrm"},
+    )
+    plugin_module.eventmanager.events.clear()
+    _save(plugin_module, instance)
+    events = plugin_module.eventmanager.events
+    assert len(events) == 1
+    etype, payload = events[0]
+    assert etype == plugin_module.EventType.PluginTriggered
+    assert payload["plugin_id"] == "GDriveTree"
+    assert payload["event_name"] == "tree.changed"
+    assert payload["__mp_target_plugin_id"] == "GDriveStrm"
+    data = payload["data"]
+    assert data["kind"] == "refresh"
+    assert data["full"] is False
+    assert {item["file_id"] for item in data["added"]} == {"root", "d1", "f1"}
+
+
+def test_refresh_skips_event_when_notify_disabled(plugin_module: Any) -> None:
+    """未开启通知时不发送任何事件。"""
+    instance = _new_plugin(plugin_module, {"enabled": True})
+    plugin_module.eventmanager.events.clear()
+    _save(plugin_module, instance)
+    assert plugin_module.eventmanager.events == []
+
+
+def test_incremental_refresh_reports_removed_node(plugin_module: Any) -> None:
+    """增量刷新删除旧节点时，事件携带 removed 明细。"""
+    instance = _new_plugin(
+        plugin_module,
+        {"enabled": True, "strm_notify": True, "strm_plugin_id": "GDriveStrm"},
+    )
+    _save(plugin_module, instance)
+    plugin_module.eventmanager.events.clear()
+    files = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "d1", "name": "Movies", "mimeType": FOLDER, "parents": ["root"]},
+        {
+            "id": "f2",
+            "name": "b.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["d1"],
+            "size": "20",
+        },
+    ]
+    change = _save_files(plugin_module, instance, files)
+    assert [item["file_id"] for item in change.removed] == ["f1"]
+    assert [item["path"] for item in change.removed] == ["/Movies/a.mkv"]
+    events = plugin_module.eventmanager.events
+    assert len(events) == 1
+    data = events[0][1]["data"]
+    assert data["removed"] == [{"file_id": "f1", "path": "/Movies/a.mkv"}]
+    assert [item["file_id"] for item in data["added"]] == ["f2"]
+
+
+def test_unchanged_refresh_does_not_publish(plugin_module: Any) -> None:
+    """没有变化的刷新不发送空事件。"""
+    instance = _new_plugin(
+        plugin_module,
+        {"enabled": True, "strm_notify": True, "strm_plugin_id": "GDriveStrm"},
+    )
+    _save(plugin_module, instance)
+    plugin_module.eventmanager.events.clear()
+    _save(plugin_module, instance)
+    assert plugin_module.eventmanager.events == []
+
+
+def test_archive_upsert_publishes_event(plugin_module: Any) -> None:
+    """归档入树增量写入后发送 kind=archive 的事件。"""
+    instance = _new_plugin(
+        plugin_module,
+        {"enabled": True, "strm_notify": True, "strm_plugin_id": "GDriveStrm"},
+    )
+    plugin_module.eventmanager.events.clear()
+    node = plugin_module.TreeNodeData(
+        file_id="f9",
+        parent_file_id="root",
+        name="new.mkv",
+        mime_type="video/x-matroska",
+        is_dir=False,
+        size=1,
+        modified_time=0.0,
+        created_time=0.0,
+        path="/new.mkv",
+        depth=1,
+        md5="",
+        trashed=False,
+        shortcut_target_id="",
+    )
+    added, updated = instance._upsert_nodes([node])
+    assert [item.file_id for item in added] == ["f9"]
+    assert updated == []
+    events = plugin_module.eventmanager.events
+    assert len(events) == 1
+    data = events[0][1]["data"]
+    assert data["kind"] == "archive"
+    assert [item["file_id"] for item in data["added"]] == ["f9"]
