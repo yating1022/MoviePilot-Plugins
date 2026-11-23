@@ -41,8 +41,38 @@ MoviePilot 三方插件仓库（仅支持 V3）：https://github.com/yating1022/
 | 标签 | 网盘 |
 | 系统要求 | MoviePilot >= 3.0.0 |
 
-## 安装
+### [Google Drive 目录树（GDriveTree）](plugins.v3/gdrivetree/README.md)
 
+复用 Google Drive 存储插件的授权配置，一次性分页拉取文件元数据并在本地按根目录裁剪建树。
+
+- 目录树持久化到插件自有数据库，支持手动与定时刷新、增量写库、分页浏览和搜索。
+- 监听整理完成事件并定时对比归档记录，把新归档到 Google Drive 的文件增量加入目录树。
+- 可把刷新、归档和清空产生的变化以 `tree.changed` 定向事件通知 STRM 插件。
+
+| 项目 | 值 |
+| --- | --- |
+| 插件 ID | `GDriveTree` |
+| 版本 | 1.2.0 |
+| 标签 | 网盘 |
+| 系统要求 | MoviePilot >= 3.0.0 |
+
+### [谷歌 STRM 管理（GDriveStrm）](plugins.v3/gdrivestrm/README.md)
+
+读取 Google Drive 目录树，把视频文件按原父子结构映射为本地 `.strm`。
+
+- `.strm` 内容为 Google Drive 文件直链，文件快捷方式使用目标文件 ID。
+- 支持目录树事件秒级增量、定时对账、手动全量同步。
+- 默认只创建视频所在目录链；失效 STRM 只清理本插件记录过的文件。
+- 幂等写入，内容一致不改变文件修改时间。
+
+| 项目 | 值 |
+| --- | --- |
+| 插件 ID | `GDriveStrm` |
+| 版本 | 1.0.0 |
+| 标签 | 网盘 |
+| 系统要求 | MoviePilot >= 3.0.0 |
+
+## 安装
 1. 打开 MoviePilot → 设置 → 插件 → 插件市场 → 添加仓库，填入：
 
    ```text
@@ -51,7 +81,7 @@ MoviePilot 三方插件仓库（仅支持 V3）：https://github.com/yating1022/
 
 2. 刷新插件列表，安装需要的插件并启用。
 
-3. 两个插件均只支持 MoviePilot V3（`system_version >= 3.0.0`），详细配置请查看各插件目录下的 `README.md`。
+3. 以上插件均只支持 MoviePilot V3（`system_version >= 3.0.0`），详细配置请查看各插件目录下的 `README.md`。
 
 ## 反馈
 
