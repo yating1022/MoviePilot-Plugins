@@ -751,6 +751,38 @@ def test_archive_event_creates_missing_parent_dirs(
     assert link is not None and link.status == "done"
 
 
+def test_archive_target_paths_prefers_dest_file(plugin_module: Any) -> None:
+    """dest 是目标文件路径时，不把源文件名拼到目标文件后面。"""
+    instance = _new_plugin(plugin_module)
+    dest = (
+        "/workspace/媒体库/电视剧/日番/葬送的芙莉莲 (2023)/Season 2/"
+        "葬送的芙莉莲.2023.S02E03.第3集.1080p.WEB-DL.H264-FROGWeb.mkv"
+    )
+    record = plugin_module.ArchiveRecord(
+        history_id=1,
+        dest=dest,
+        dest_storage="gdrive",
+        dest_fileitem={"fileid": "f1", "path": dest, "type": "file"},
+        files=["/downloads/Frieren.Beyond.Journey's.End.S02E03.mkv"],
+    )
+    assert instance._archive_target_paths(record) == [dest]
+
+
+def test_archive_target_paths_maps_files_under_dir(plugin_module: Any) -> None:
+    """dest 是目录时，源文件名落到目标目录下。"""
+    instance = _new_plugin(plugin_module)
+    record = plugin_module.ArchiveRecord(
+        history_id=2,
+        dest="/workspace/媒体库/电影",
+        dest_storage="gdrive",
+        dest_fileitem={"path": "/workspace/媒体库/电影", "type": "dir"},
+        files=["/downloads/a.mkv"],
+    )
+    assert instance._archive_target_paths(record) == [
+        "/workspace/媒体库/电影/a.mkv"
+    ]
+
+
 class _FakeArchiveSource:
     """替换宿主整理历史源的替身。"""
 

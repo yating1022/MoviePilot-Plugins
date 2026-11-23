@@ -12,7 +12,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Type
 
 from fastapi import Body
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, delete, func, or_, select
@@ -175,6 +175,28 @@ def _join_child_path(parent_path: str, name: str, is_dir: bool) -> str:
     return child
 
 
+def _as_absolute(path: Any) -> str:
+    """把路径统一为以 / 开头的 POSIX 路径。"""
+    text = str(path or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    if not text.startswith("/"):
+        text = "/" + text
+    return text
+
+
+def _dedupe_paths(paths: Iterable[str]) -> List[str]:
+    """去重并统一为绝对路径。"""
+    seen: set = set()
+    result: List[str] = []
+    for path in paths:
+        text = _as_absolute(path)
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
 def _format_size(size: Any) -> str:
     """把字节数格式化为易读文本。"""
     value = float(max(0, int(size or 0)))
@@ -216,7 +238,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -965,6 +987,54 @@ class GDriveTree(_PluginBase):
                 client.close()
             self._archive_lock.release()
 
+    def _archive_target_paths(self, record: ArchiveRecord) -> List[str]:
+        """
+        从归档记录提取目标文件路径。
+
+        宿主历史里的 ``dest`` 是 ``target_item.path``（通常是目标文件路径），
+        ``files`` 是处理文件清单（可能是源路径）。不能把源文件名拼到目标文件路径后。
+        """
+        item = record.dest_fileitem or {}
+        dest = str(record.dest or "").strip().replace("\\", "/")
+        item_path = str(item.get("path") or "").strip().replace("\\", "/")
+        dest_path = item_path or dest
+        files = [
+            str(path).strip().replace("\\", "/")
+            for path in record.files
+            if str(path).strip()
+        ]
+        if not dest_path:
+            return _dedupe_paths(files)
+        item_type = str(item.get("type") or "").lower()
+        if (
+            dest_path.endswith("/")
+            or item_type in ("dir", "directory", "folder")
+            or bool(item.get("is_dir"))
+        ):
+            is_dir = True
+        elif item_type in ("file", ""):
+            is_dir = not PurePosixPath(dest_path.rstrip("/")).suffix
+        else:
+            is_dir = False
+        if is_dir:
+            base = dest_path.rstrip("/")
+            result = [
+                self._normalize_archive_path(raw, base)
+                for raw in (files or [base])
+            ]
+            return _dedupe_paths(path for path in result if path)
+        dest_path = _as_absolute(dest_path.rstrip("/"))
+        base_dir = str(PurePosixPath(dest_path).parent or "/").rstrip("/")
+        result = [dest_path]
+        for raw in files:
+            if not raw or raw == dest_path:
+                continue
+            if raw.startswith(base_dir + "/"):
+                result.append(raw)
+            elif not raw.startswith("/"):
+                result.append(f"{base_dir}/{raw.lstrip('/')}")
+        return _dedupe_paths(result)
+
     def _nodes_for_archive_record(
         self,
         client: GDriveTreeClient,
@@ -982,23 +1052,10 @@ class GDriveTree(_PluginBase):
                 )
             except GDriveTreeError as err:
                 errors.append(f"按文件 ID {target_id} 解析失败：{err}")
-        raw_paths = [str(path) for path in record.files if str(path).strip()]
-        if not raw_paths:
-            item = record.dest_fileitem or {}
-            item_path = str(item.get("path") or "").strip()
-            item_name = str(item.get("name") or item.get("basename") or "").strip()
-            if item_path:
-                raw_paths = [item_path]
-            elif item_name and record.dest:
-                raw_paths = [f"{record.dest.rstrip('/')}/{item_name}"]
-            elif record.dest:
-                raw_paths = [record.dest]
+        target_paths = self._archive_target_paths(record)
         merged: Dict[str, TreeNodeData] = {}
         resolved = False
-        for raw_path in raw_paths:
-            path = self._normalize_archive_path(str(raw_path), record.dest)
-            if not path:
-                continue
+        for path in target_paths:
             try:
                 nodes = self._ensure_nodes_for_path(client, path)
             except GDriveTreeError as err:
