@@ -10,3 +10,4 @@
 | [Page API Envelope & Layout](./page-api-envelope.md) | 详情页（`get_page`）按钮 API 响应契约、页面事件刷新机制、Vuetify 布局陷阱 |
 | [Custom Storage Backend](./storage-extension.md) | 通过插件注册自定义存储、`StorageOperSelection` 适配器、`get_module` 存储方法与严格查询语义 |
 | [Plugin Database & Config Sharing](./plugin-database-and-config-sharing.md) | 通过 `get_config(plugin_id)` 复用其他插件配置、插件自有表、快照式刷新与后台线程/取消模式 |
+| [Cross-plugin Events](./cross-plugin-events.md) | `EventType.PluginTriggered` 定向事件、载荷上限与 `tree.changed` 契约 |
