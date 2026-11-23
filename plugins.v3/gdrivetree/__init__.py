@@ -35,8 +35,15 @@ from .tree_builder import (
     build_tree,
     normalize_root_path,
 )
+from .tree_events import (
+    TreeChangeSet,
+    build_payload,
+    change_from_nodes,
+    full_signal,
+)
 
 DEFAULT_SOURCE_PLUGIN = "GDriveStorage"
+DEFAULT_STRM_PLUGIN = "GDriveStrm"
 DEFAULT_ROOT_PATH = "/"
 DEFAULT_INTERVAL_HOURS = 24
 DEFAULT_MAX_PAGES = 2000
@@ -196,7 +203,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -218,6 +225,8 @@ class GDriveTree(_PluginBase):
         self._incremental_write = True
         self._archive_watch = True
         self._archive_interval_minutes = DEFAULT_ARCHIVE_INTERVAL_MINUTES
+        self._strm_notify = False
+        self._strm_plugin_id = DEFAULT_STRM_PLUGIN
         self._page = 1
         self._stop_event = threading.Event()
         self._refresh_lock = threading.Lock()
@@ -245,6 +254,8 @@ class GDriveTree(_PluginBase):
         self._incremental_write = bool(cfg["incremental_write"])
         self._archive_watch = bool(cfg["archive_watch"])
         self._archive_interval_minutes = cfg["archive_poll_interval_minutes"]
+        self._strm_notify = bool(cfg["strm_notify"])
+        self._strm_plugin_id = cfg["strm_plugin_id"]
         self._page = 1
         self._thread = None
         self._archive_thread = None
@@ -317,6 +328,10 @@ class GDriveTree(_PluginBase):
                 1440,
                 DEFAULT_ARCHIVE_INTERVAL_MINUTES,
             ),
+            "strm_notify": bool(cfg.get("strm_notify")),
+            "strm_plugin_id": str(
+                cfg.get("strm_plugin_id") or DEFAULT_STRM_PLUGIN
+            ).strip() or DEFAULT_STRM_PLUGIN,
         }
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -496,6 +511,38 @@ class GDriveTree(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "strm_notify",
+                                        "label": "通知 STRM 插件",
+                                        "hint": "目录树变化后发送 tree.changed 事件",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "strm_plugin_id",
+                                        "label": "STRM 插件 ID",
+                                        "placeholder": DEFAULT_STRM_PLUGIN,
+                                        "hint": "默认 GDriveStrm；使用分身时填分身 ID",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                        ],
+                    },
                 ],
             }
         ], {
@@ -510,6 +557,8 @@ class GDriveTree(_PluginBase):
             "incremental_write": True,
             "archive_watch": True,
             "archive_poll_interval_minutes": DEFAULT_ARCHIVE_INTERVAL_MINUTES,
+            "strm_notify": False,
+            "strm_plugin_id": DEFAULT_STRM_PLUGIN,
         }
 
     # ------------------------------------------------------------------
@@ -1023,11 +1072,15 @@ class GDriveTree(_PluginBase):
             logger.debug("【GDriveTree】按路径查询节点失败", exc_info=True)
             return None
 
-    def _upsert_nodes(self, nodes: List[TreeNodeData]) -> None:
-        """按 file_id 增量写入节点，不删除其它节点。"""
+    def _upsert_nodes(
+        self, nodes: List[TreeNodeData]
+    ) -> Tuple[List[TreeNodeData], List[TreeNodeData]]:
+        """按 file_id 增量写入节点，不删除其它节点；提交后通知 STRM 插件。"""
         if not nodes:
-            return
+            return [], []
         now = datetime.now()
+        added: List[TreeNodeData] = []
+        updated: List[TreeNodeData] = []
         with self._session() as session:
             ids = [node.file_id for node in nodes]
             existing = {
@@ -1041,11 +1094,18 @@ class GDriveTree(_PluginBase):
                 row = existing.get(node.file_id)
                 if row is None:
                     session.add(TreeNode(**values))
-                else:
+                    added.append(node)
+                elif self._node_changed(row, node):
                     values.pop("created_at", None)
                     for key, value in values.items():
                         setattr(row, key, value)
+                    updated.append(node)
             session.commit()
+        if added or updated:
+            self._publish_tree_change(
+                change_from_nodes("archive", added=added, updated=updated)
+            )
+        return added, updated
 
     def _link_update(
         self,
@@ -1198,6 +1258,30 @@ class GDriveTree(_PluginBase):
         except SQLAlchemyError:
             logger.exception("【GDriveTree】写入刷新状态失败")
 
+    def _instance_id(self) -> str:
+        """返回当前插件实例 ID；分身使用宿主改写后的实例 ID。"""
+        cls = type(self)
+        return str(getattr(cls, "plugin_instance_id", "") or cls.__name__)
+
+    def _publish_tree_change(self, change: TreeChangeSet) -> None:
+        """把目录树变化定向通知 STRM 插件；通知失败不影响刷新。"""
+        if not self._enabled or not self._strm_notify:
+            return
+        target = str(self._strm_plugin_id or "").strip()
+        if not target:
+            return
+        try:
+            payload = build_payload(self._instance_id(), target, change)
+            eventmanager.send_event(EventType.PluginTriggered, payload)
+            logger.debug(
+                f"【GDriveTree】已通知 STRM 插件 {target}："
+                f"kind={change.kind}，新增={len(change.added)}，"
+                f"更新={len(change.updated)}，删除={len(change.removed)}，"
+                f"全量={change.full}"
+            )
+        except Exception:
+            logger.warning("【GDriveTree】发送目录树变化事件失败", exc_info=True)
+
     def _save_snapshot(
         self,
         nodes: List[TreeNodeData],
@@ -1206,18 +1290,21 @@ class GDriveTree(_PluginBase):
         source: Dict[str, str],
         pages: int,
         duration: float,
-    ) -> None:
-        """按配置选择整体替换或按 file_id 增量写库。"""
+    ) -> TreeChangeSet:
+        """按配置选择整体替换或按 file_id 增量写库，并在提交后发布变化事件。"""
         now = datetime.now()
         rows = [self._node_values(node, now) for node in nodes]
         if self._incremental_write:
-            self._save_snapshot_incremental(
+            change = self._save_snapshot_incremental(
                 nodes, rows, stats, root, source, pages, duration, now
             )
         else:
-            self._save_snapshot_replace(
+            change = self._save_snapshot_replace(
                 rows, stats, root, source, pages, duration, now
             )
+        if change.full or change.node_count:
+            self._publish_tree_change(change)
+        return change
 
     @staticmethod
     def _node_values(node: TreeNodeData, now: datetime) -> Dict[str, Any]:
@@ -1312,8 +1399,8 @@ class GDriveTree(_PluginBase):
         pages: int,
         duration: float,
         now: datetime,
-    ) -> None:
-        """整体替换模式：删除旧节点后批量写入。"""
+    ) -> TreeChangeSet:
+        """整体替换模式：删除旧节点后批量写入，并返回全量信号。"""
         with self._session() as session:
             session.execute(delete(TreeNode))
             batch = 500
@@ -1327,6 +1414,7 @@ class GDriveTree(_PluginBase):
                 meta, stats, root, source, pages, duration, now
             )
             session.commit()
+        return full_signal("refresh")
 
     def _save_snapshot_incremental(
         self,
@@ -1338,8 +1426,8 @@ class GDriveTree(_PluginBase):
         pages: int,
         duration: float,
         now: datetime,
-    ) -> None:
-        """增量模式：删除缺失、插入新增、只更新变化行。"""
+    ) -> TreeChangeSet:
+        """增量模式：删除缺失、插入新增、只更新变化行，并返回变更集。"""
         with self._session() as session:
             existing = {
                 row.file_id: row
@@ -1347,6 +1435,7 @@ class GDriveTree(_PluginBase):
             }
             new_ids = {node.file_id for node in nodes}
             missing = [file_id for file_id in existing if file_id not in new_ids]
+            removed = [(file_id, existing[file_id].path) for file_id in missing]
             for start in range(0, len(missing), 500):
                 session.execute(
                     delete(TreeNode).where(
@@ -1355,15 +1444,19 @@ class GDriveTree(_PluginBase):
                 )
             inserts: List[Dict[str, Any]] = []
             updates: List[Dict[str, Any]] = []
+            added_nodes: List[TreeNodeData] = []
+            updated_nodes: List[TreeNodeData] = []
             for node, row in zip(nodes, rows):
                 old = existing.get(node.file_id)
                 if old is None:
                     inserts.append(row)
+                    added_nodes.append(node)
                 elif self._node_changed(old, node):
                     update_row = dict(row)
                     update_row["id"] = old.id
                     update_row.pop("created_at", None)
                     updates.append(update_row)
+                    updated_nodes.append(node)
             for start in range(0, len(inserts), 500):
                 session.bulk_insert_mappings(
                     TreeNode, inserts[start:start + 500]
@@ -1383,6 +1476,12 @@ class GDriveTree(_PluginBase):
         logger.info(
             f"【GDriveTree】增量写库：删除={len(missing)}，插入={len(inserts)}，"
             f"更新={len(updates)}，未变化={len(rows) - len(inserts) - len(updates)}"
+        )
+        return change_from_nodes(
+            "refresh",
+            added=added_nodes,
+            updated=updated_nodes,
+            removed=removed,
         )
 
     def _safe_failed(self, status: str, error: str) -> None:
@@ -1661,6 +1760,7 @@ class GDriveTree(_PluginBase):
             logger.exception("【GDriveTree】清空目录树失败")
             return {"success": False, "message": "清空失败，请查看日志", "data": None}
         self._page = 1
+        self._publish_tree_change(full_signal("clear"))
         logger.info(f"【GDriveTree】已清空目录树节点：{deleted} 条")
         return {"success": True, "message": f"已清空 {deleted} 条节点", "data": {"deleted": deleted}}
 

@@ -14,6 +14,8 @@
 - **增量写库**：全量刷新后按 `file_id` 对比数据库，只删除缺失、插入新增、更新变化行。
 - **归档增量**：监听整理完成事件，并定时对比宿主归档记录；通过 `archive_link` 表去重，
   把新归档到 Google Drive 的文件及其父目录增量加入目录树。
+- **STRM 联动**：可选中开启「通知 STRM 插件」，刷新/归档/清空后向指定插件发送
+  `tree.changed` 事件，供 Google STRM 管理插件秒级增量生成 STRM。
 - **浏览与搜索**：详情页分页表格；`/search` API 支持按名称/路径关键字搜索。
 
 ## 前置条件
@@ -38,6 +40,8 @@
 | 全量刷新时增量写库 | 开 | 只删除缺失、插入新增、更新变化节点 |
 | 监控归档记录增量入树 | 开 | 监听整理完成事件 + 定时对比归档记录 |
 | 归档轮询间隔（分钟） | 5 | 1–1440 |
+| 通知 STRM 插件 | 关 | 目录树变化后发送 `tree.changed` 事件 |
+| STRM 插件 ID | `GDriveStrm` | 目标插件实例 ID；分身填分身 ID |
 
 ## 抓取原理与限制
 
@@ -73,6 +77,19 @@
 | `/archive/status` | 无 | 归档增量处理状态 |
 
 所有接口返回恰好三键 `{success, message, data}`。
+
+## STRM 事件通知
+
+开启「通知 STRM 插件」后，插件在以下时点通过
+`EventType.PluginTriggered` 定向发送事件（`event_name = "tree.changed"`）：
+
+- 全量/增量刷新成功写库后（`kind = "refresh"`）；
+- 整理完成或归档轮询增量入树后（`kind = "archive"`）；
+- 清空目录树后（`kind = "clear"`，`full = true`）。
+
+事件 `data` 携带 `added` / `updated` / `removed` 节点明细；变更节点超过
+2000 个或整体替换时只发送 `full = true` 的全量信号。目标是事件数据中的
+`__mp_target_plugin_id`，只有该插件实例会收到。通知失败只记日志，不影响刷新。
 
 ## 常见错误
 
