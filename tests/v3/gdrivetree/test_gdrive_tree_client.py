@@ -357,6 +357,20 @@ def test_missing_refresh_token_rejected() -> None:
         client.refresh_access_token()
 
 
+def test_find_child_by_name() -> None:
+    """按父目录和名称查询子项。"""
+    transport = FakeTransport([
+        _token(),
+        FakeResponse(payload={"files": [{"id": "f1", "name": "a.mkv"}]}),
+    ])
+    meta = _make_client(transport).find_child("parent-1", "a.mkv")
+    assert meta["id"] == "f1"
+    params = transport.calls[1]["params"]
+    assert params["corpora"] == "allDrives"
+    assert "'parent-1' in parents" in params["q"]
+    assert "name = 'a.mkv'" in params["q"]
+
+
 def test_close_closes_transport() -> None:
     """close 传递到传输层。"""
     transport = FakeTransport([])

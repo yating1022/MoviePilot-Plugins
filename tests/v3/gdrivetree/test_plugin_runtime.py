@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -20,11 +20,32 @@ PACKAGE_NAME = "gdrivetree_plugin_under_test"
 FOLDER = "application/vnd.google-apps.folder"
 STUB_NAMES = (
     "app",
+    "app.schemas",
+    "app.schemas.types",
     "app.sdk",
     "app.sdk.database",
+    "app.sdk.events",
     "app.sdk.logging",
     "app.sdk.plugin",
 )
+
+
+class _StubEventType:
+    """宿主 EventType 的最小替身。"""
+
+    TransferComplete = "transfer.complete"
+
+
+class _StubEventManager:
+    """宿主 eventmanager 的最小替身。"""
+
+    def register(self, *args: Any, **kwargs: Any):
+        """返回保持原函数不变的装饰器。"""
+
+        def decorator(func):
+            return func
+
+        return decorator
 
 
 class _StubLogger:
@@ -101,21 +122,33 @@ def _declarative_base() -> type[DeclarativeBase]:
 def _install_stubs() -> None:
     """在 sys.modules 中安装 app.* 桩。"""
     app = types.ModuleType("app")
+    schemas = types.ModuleType("app.schemas")
+    schema_types = types.ModuleType("app.schemas.types")
     sdk = types.ModuleType("app.sdk")
     database = types.ModuleType("app.sdk.database")
+    events = types.ModuleType("app.sdk.events")
     logging_module = types.ModuleType("app.sdk.logging")
     plugin_module = types.ModuleType("app.sdk.plugin")
+    schema_types.EventType = _StubEventType
     database.plugin_declarative_base = _declarative_base
+    events.Event = object
+    events.eventmanager = _StubEventManager()
     logging_module.logger = _StubLogger()
     plugin_module._PluginBase = _StubPluginBase
+    schemas.types = schema_types
     sdk.database = database
+    sdk.events = events
     sdk.logging = logging_module
     sdk.plugin = plugin_module
+    app.schemas = schemas
     app.sdk = sdk
     sys.modules.update({
         "app": app,
+        "app.schemas": schemas,
+        "app.schemas.types": schema_types,
         "app.sdk": sdk,
         "app.sdk.database": database,
+        "app.sdk.events": events,
         "app.sdk.logging": logging_module,
         "app.sdk.plugin": plugin_module,
     })
@@ -242,8 +275,10 @@ def test_api_envelopes_are_three_keys(plugin_module: Any) -> None:
     assert set(instance.api_status()) == {"success", "message", "data"}
     assert set(instance.api_nodes_page({"page": 1})) == {"success", "message", "data"}
     assert set(instance.api_search({"keyword": "x"})) == {"success", "message", "data"}
+    assert set(instance.api_archive_status()) == {"success", "message", "data"}
     disabled = _new_plugin(plugin_module, {"enabled": False})
     assert set(disabled.api_refresh()) == {"success", "message", "data"}
+    assert set(disabled.api_archive_scan()) == {"success", "message", "data"}
 
 
 def test_extract_drive_id_variants(plugin_module: Any) -> None:
@@ -258,17 +293,38 @@ def test_extract_drive_id_variants(plugin_module: Any) -> None:
 
 
 def test_get_service_respects_switches(plugin_module: Any) -> None:
-    """定时服务仅在启用且开启自动刷新时注册。"""
+    """全量刷新与归档轮询分别按开关注册。"""
     disabled = _new_plugin(plugin_module, {"enabled": False, "auto_refresh": True})
     assert disabled.get_service() == []
-    no_auto = _new_plugin(plugin_module, {"enabled": True, "auto_refresh": False})
-    assert no_auto.get_service() == []
+    no_service = _new_plugin(
+        plugin_module,
+        {"enabled": True, "auto_refresh": False, "archive_watch": False},
+    )
+    assert no_service.get_service() == []
     enabled = _new_plugin(
         plugin_module,
-        {"enabled": True, "auto_refresh": True, "refresh_interval_hours": 6},
+        {
+            "enabled": True,
+            "auto_refresh": True,
+            "refresh_interval_hours": 6,
+            "archive_watch": False,
+        },
     )
     services = enabled.get_service()
     assert services and services[0]["kwargs"]["seconds"] == 6 * 3600
+    archive_only = _new_plugin(
+        plugin_module,
+        {
+            "enabled": True,
+            "auto_refresh": False,
+            "archive_watch": True,
+            "archive_poll_interval_minutes": 3,
+        },
+    )
+    services = archive_only.get_service()
+    assert len(services) == 1
+    assert services[0]["id"] == "GDriveTreeArchive"
+    assert services[0]["kwargs"]["seconds"] == 180
 
 
 def test_start_refresh_requires_enabled(plugin_module: Any) -> None:
@@ -438,3 +494,177 @@ def test_clear_rejected_while_refreshing(plugin_module: Any) -> None:
         instance._refresh_lock.release()
     assert result["success"] is False
     assert "刷新进行中" in result["message"]
+
+
+def test_incremental_write_deletes_inserts_and_updates(plugin_module: Any) -> None:
+    """增量写库只删除缺失、插入新增、更新变化行。"""
+    instance = _new_plugin(plugin_module)
+    _save(plugin_module, instance)
+    with instance._session() as session:
+        before = {
+            row.file_id: row.id
+            for row in session.scalars(select(plugin_module.TreeNode))
+        }
+    files = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "d1", "name": "Films", "mimeType": FOLDER, "parents": ["root"]},
+        {
+            "id": "f2",
+            "name": "b.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["d1"],
+            "size": "5",
+        },
+    ]
+    nodes, stats = plugin_module.build_tree(
+        files, root_id="root", root_name="Root", root_path="/"
+    )
+    root = plugin_module.RootInfo(file_id="root", name="Root", drive_id="", corpora="user")
+    instance._incremental_write = True
+    instance._save_snapshot(nodes, stats, root, {"root_path": "/"}, 1, 0.1)
+    with instance._session() as session:
+        rows = {row.file_id: row for row in session.scalars(select(plugin_module.TreeNode))}
+    assert set(rows) == {"root", "d1", "f2"}
+    assert rows["root"].id == before["root"]
+    assert rows["d1"].id == before["d1"]
+    assert rows["d1"].name == "Films"
+    assert rows["d1"].path == "/Films/"
+    assert rows["f2"].size == 5
+
+
+class _FakeArchiveClient:
+    """归档测试用客户端替身。"""
+
+    files: Dict[str, Dict[str, Any]] = {}
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.kwargs = kwargs
+
+    def resolve_root(self, root_id: str, fallback_name: str = "") -> Any:
+        return _FakeArchiveClient.root_info
+
+    def get_file(self, file_id: str, fields: Any = None) -> Dict[str, Any]:
+        return dict(_FakeArchiveClient.files[file_id])
+
+    def find_child(self, parent_id: str, name: str) -> Optional[Dict[str, Any]]:
+        for meta in _FakeArchiveClient.files.values():
+            if meta.get("name") == name and parent_id in (meta.get("parents") or []):
+                return dict(meta)
+        return None
+
+    def close(self) -> None:
+        pass
+
+
+_FakeArchiveClient.root_info = None
+
+
+def _archive_files() -> Dict[str, Dict[str, Any]]:
+    """构造 root -> Movies -> a.mkv 的云端元数据。"""
+    return {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "d1": {"id": "d1", "name": "Movies", "mimeType": FOLDER, "parents": ["root"]},
+        "f1": {
+            "id": "f1",
+            "name": "a.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["d1"],
+            "size": "10",
+        },
+    }
+
+
+def test_archive_event_inserts_parent_chain(plugin_module: Any, monkeypatch: Any) -> None:
+    """归档事件按 fileid 拉取父链并增量入树。"""
+    instance = _new_plugin(plugin_module)
+    _FakeArchiveClient.files = _archive_files()
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target("f1", "/Movies/a.mkv", 42)
+    with instance._session() as session:
+        rows = {row.file_id: row for row in session.scalars(select(plugin_module.TreeNode))}
+        link = session.scalar(
+            select(plugin_module.ArchiveLink).where(
+                plugin_module.ArchiveLink.history_id == 42
+            )
+        )
+    assert {"root", "d1", "f1"} <= set(rows)
+    assert rows["f1"].path == "/Movies/a.mkv"
+    assert rows["f1"].parent_file_id == "d1"
+    assert link is not None and link.status == "done"
+
+
+class _FakeArchiveSource:
+    """替换宿主整理历史源的替身。"""
+
+    records: List[Any] = []
+
+    def __init__(self, storage_names: Any) -> None:
+        self.storage_names = storage_names
+
+    def iter_records(self, **kwargs: Any):
+        return iter(self.records)
+
+    target_file_id = staticmethod(
+        lambda record: str(record.dest_fileitem.get("fileid") or "")
+    )
+
+
+def test_archive_scan_skips_processed_history(plugin_module: Any, monkeypatch: Any) -> None:
+    """归档轮询处理一次后不会重复处理同一条历史。"""
+    instance = _new_plugin(plugin_module)
+    _FakeArchiveClient.files = _archive_files()
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    _FakeArchiveSource.records = [
+        plugin_module.ArchiveRecord(
+            history_id=7,
+            dest="/Movies",
+            dest_storage="gdrive",
+            dest_fileitem={"fileid": "f1"},
+            files=[],
+        )
+    ]
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    monkeypatch.setattr(plugin_module, "ArchiveSource", _FakeArchiveSource)
+    first = instance.scan_archive()
+    assert first["processed"] == 1
+    assert first["failed"] == 0
+    second = instance.scan_archive()
+    assert second["processed"] == 0
+    assert second["skipped"] == 1
+    counts = instance._archive_link_counts()
+    assert counts == {"total": 1, "done": 1, "failed": 0, "pending": 0}
+
+
+def test_archive_scan_records_failure(plugin_module: Any, monkeypatch: Any) -> None:
+    """归档目标无法解析时记录 failed 并保留重试次数。"""
+    instance = _new_plugin(plugin_module)
+    _FakeArchiveClient.files = {}
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    _FakeArchiveSource.records = [
+        plugin_module.ArchiveRecord(
+            history_id=8,
+            dest="/Missing",
+            dest_storage="gdrive",
+            dest_fileitem={},
+            files=["/Missing/none.mkv"],
+        )
+    ]
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    monkeypatch.setattr(plugin_module, "ArchiveSource", _FakeArchiveSource)
+    result = instance.scan_archive()
+    assert result["failed"] == 1
+    with instance._session() as session:
+        link = session.scalar(
+            select(plugin_module.ArchiveLink).where(
+                plugin_module.ArchiveLink.history_id == 8
+            )
+        )
+    assert link.status == "failed"
+    assert link.retry_count == 1

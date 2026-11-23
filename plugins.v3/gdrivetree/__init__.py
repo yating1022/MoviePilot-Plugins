@@ -19,13 +19,22 @@ from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Te
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.schemas.types import EventType
 from app.sdk.database import plugin_declarative_base
+from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
 
+from .archive_source import ArchiveRecord, ArchiveSource
 from .errors import GDriveTreeAuthError, GDriveTreeCancelled, GDriveTreeError
-from .gdrive_tree_client import GDriveTreeClient, RootInfo
-from .tree_builder import TreeStats, build_tree, normalize_root_path
+from .gdrive_tree_client import FILE_FIELDS, GDriveTreeClient, RootInfo
+from .tree_builder import (
+    FOLDER_MIME,
+    TreeStats,
+    TreeNodeData,
+    build_tree,
+    normalize_root_path,
+)
 
 DEFAULT_SOURCE_PLUGIN = "GDriveStorage"
 DEFAULT_ROOT_PATH = "/"
@@ -33,6 +42,9 @@ DEFAULT_INTERVAL_HOURS = 24
 DEFAULT_MAX_PAGES = 2000
 DEFAULT_MAX_NODES = 200_000
 DEFAULT_PAGE_SIZE = 20
+DEFAULT_ARCHIVE_INTERVAL_MINUTES = 5
+ARCHIVE_MAX_RETRIES = 3
+ARCHIVE_SCAN_LIMIT = 50
 
 _PluginDBBase = plugin_declarative_base()
 
@@ -62,6 +74,26 @@ class TreeMeta(_PluginDBBase):
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ArchiveLink(_PluginDBBase):
+    """归档记录与目录树的增量处理状态。"""
+
+    __tablename__ = "archive_link"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    history_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    dest_path: Mapped[str] = mapped_column(String(2048), default="")
+    dest_storage: Mapped[str] = mapped_column(String(128), default="")
+    dest_file_id: Mapped[str] = mapped_column(String(128), index=True, default="")
+    status: Mapped[str] = mapped_column(String(16), index=True, default="pending")
+    node_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
 
 
 class TreeNode(_PluginDBBase):
@@ -164,7 +196,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -183,10 +215,15 @@ class GDriveTree(_PluginBase):
         self._max_pages = DEFAULT_MAX_PAGES
         self._max_nodes = DEFAULT_MAX_NODES
         self._page_size = DEFAULT_PAGE_SIZE
+        self._incremental_write = True
+        self._archive_watch = True
+        self._archive_interval_minutes = DEFAULT_ARCHIVE_INTERVAL_MINUTES
         self._page = 1
         self._stop_event = threading.Event()
         self._refresh_lock = threading.Lock()
+        self._archive_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._archive_thread: Optional[threading.Thread] = None
         self._client: Optional[GDriveTreeClient] = None
 
     # ------------------------------------------------------------------
@@ -205,8 +242,12 @@ class GDriveTree(_PluginBase):
         self._max_pages = cfg["max_pages"]
         self._max_nodes = cfg["max_nodes"]
         self._page_size = cfg["page_size"]
+        self._incremental_write = bool(cfg["incremental_write"])
+        self._archive_watch = bool(cfg["archive_watch"])
+        self._archive_interval_minutes = cfg["archive_poll_interval_minutes"]
         self._page = 1
         self._thread = None
+        self._archive_thread = None
         if self._enabled:
             logger.info(
                 f"【GDriveTree】插件已启用 v{self.plugin_version}："
@@ -244,7 +285,7 @@ class GDriveTree(_PluginBase):
 
     def get_database_models(self) -> List[Type[Any]]:
         """声明插件自有表。"""
-        return [TreeMeta, TreeNode]
+        return [TreeMeta, TreeNode, ArchiveLink]
 
     # ------------------------------------------------------------------
     # 配置
@@ -268,6 +309,14 @@ class GDriveTree(_PluginBase):
                 cfg.get("max_nodes"), 1, 1_000_000, DEFAULT_MAX_NODES
             ),
             "page_size": _clamp_int(cfg.get("page_size"), 5, 100, DEFAULT_PAGE_SIZE),
+            "incremental_write": bool(cfg.get("incremental_write", True)),
+            "archive_watch": bool(cfg.get("archive_watch", True)),
+            "archive_poll_interval_minutes": _clamp_int(
+                cfg.get("archive_poll_interval_minutes"),
+                1,
+                1440,
+                DEFAULT_ARCHIVE_INTERVAL_MINUTES,
+            ),
         }
 
     def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
@@ -406,6 +455,47 @@ class GDriveTree(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "incremental_write",
+                                        "label": "全量刷新时增量写库",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "archive_watch",
+                                        "label": "监控归档记录增量入树",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "archive_poll_interval_minutes",
+                                        "label": "归档轮询间隔（分钟）",
+                                        "type": "number",
+                                        "min": 1,
+                                        "max": 1440,
+                                    },
+                                }],
+                            },
+                        ],
+                    },
                 ],
             }
         ], {
@@ -417,22 +507,38 @@ class GDriveTree(_PluginBase):
             "max_pages": DEFAULT_MAX_PAGES,
             "max_nodes": DEFAULT_MAX_NODES,
             "page_size": DEFAULT_PAGE_SIZE,
+            "incremental_write": True,
+            "archive_watch": True,
+            "archive_poll_interval_minutes": DEFAULT_ARCHIVE_INTERVAL_MINUTES,
         }
 
     # ------------------------------------------------------------------
     # 定时服务
     # ------------------------------------------------------------------
     def get_service(self) -> Optional[List[Dict[str, Any]]]:
-        """启用且开启定时刷新时注册 interval 服务。"""
-        if not self._enabled or not self._auto_refresh:
+        """按开关注册全量刷新和归档轮询服务。"""
+        if not self._enabled:
             return []
-        return [{
-            "id": "GDriveTree",
-            "name": "Google Drive 目录树（定时刷新）",
-            "trigger": "interval",
-            "func": self.refresh_from_scheduler,
-            "kwargs": {"seconds": max(3600, self._interval_hours * 3600)},
-        }]
+        services: List[Dict[str, Any]] = []
+        if self._auto_refresh:
+            services.append({
+                "id": "GDriveTree",
+                "name": "Google Drive 目录树（定时刷新）",
+                "trigger": "interval",
+                "func": self.refresh_from_scheduler,
+                "kwargs": {"seconds": max(3600, self._interval_hours * 3600)},
+            })
+        if self._archive_watch:
+            services.append({
+                "id": "GDriveTreeArchive",
+                "name": "Google Drive 目录树（归档增量）",
+                "trigger": "interval",
+                "func": self.scan_archive_from_scheduler,
+                "kwargs": {
+                    "seconds": max(60, self._archive_interval_minutes * 60)
+                },
+            })
+        return services
 
     def refresh_from_scheduler(self) -> None:
         """调度器入口：只启动后台刷新，立即返回。"""
@@ -605,6 +711,471 @@ class GDriveTree(_PluginBase):
         return client.resolve_root(root_folder_id, fallback_name=fallback_name)
 
     # ------------------------------------------------------------------
+    # 归档增量
+    # ------------------------------------------------------------------
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event) -> None:
+        """监听整理完成事件，实时把 Google Drive 目标加入目录树。"""
+        if not self._enabled or not self._archive_watch:
+            return
+        try:
+            data = event.event_data
+            transferinfo = getattr(data, "transferinfo", None)
+            target = getattr(transferinfo, "target_item", None) if transferinfo else None
+            if target is None and transferinfo is not None:
+                target = getattr(transferinfo, "target_diritem", None)
+            if target is None:
+                return
+            storage = str(getattr(target, "storage", "") or "")
+            if storage not in self._gdrive_storage_names():
+                return
+            file_id = str(
+                getattr(target, "fileid", "") or getattr(target, "file_id", "") or ""
+            )
+            path = str(getattr(target, "path", "") or "")
+            history_id = int(getattr(data, "transfer_history_id", 0) or 0)
+        except Exception:
+            logger.debug("【GDriveTree】解析整理完成事件失败", exc_info=True)
+            return
+        if not file_id and not path:
+            return
+        threading.Thread(
+            target=self._handle_event_target,
+            args=(file_id, path, history_id, storage),
+            name="GDriveTree-archive-event",
+            daemon=True,
+        ).start()
+
+    def _gdrive_storage_names(self) -> set:
+        """返回目标存储可能使用的标识（类型与显示名）。"""
+        raw = self.get_config(self._source_plugin_id)
+        names = {"gdrive"}
+        if isinstance(raw, dict):
+            display = str(raw.get("display_name") or "").strip()
+            if display:
+                names.add(display)
+        return names
+
+    def _handle_event_target(
+        self,
+        file_id: str,
+        path: str,
+        history_id: int,
+        storage: str = "",
+    ) -> None:
+        """处理单条整理完成事件。"""
+        if not self._archive_lock.acquire(blocking=False):
+            logger.info("【GDriveTree】归档处理繁忙，事件交由定时轮询补偿")
+            return
+        client: Optional[GDriveTreeClient] = None
+        try:
+            source = self._read_source_config()
+            client = GDriveTreeClient(
+                client_id=source["client_id"],
+                client_secret=source["client_secret"],
+                refresh_token=source["refresh_token"],
+            )
+            root = self._resolve_root(client, source)
+            nodes = self._nodes_for_target(client, root, source, file_id=file_id, path=path)
+            self._upsert_nodes(nodes)
+            self._link_update(
+                history_id, path, storage, file_id, "done", len(nodes), ""
+            )
+            self._recount_meta()
+            logger.info(
+                f"【GDriveTree】归档事件已入树：{path or file_id}，节点={len(nodes)}"
+            )
+        except Exception as err:
+            logger.warning(f"【GDriveTree】归档事件处理失败：{path or file_id} - {err}")
+            self._link_update(history_id, path, storage, file_id, "failed", 0, str(err))
+        finally:
+            if client is not None:
+                client.close()
+            self._archive_lock.release()
+
+    def scan_archive_from_scheduler(self) -> None:
+        """调度器入口：只启动后台扫描，立即返回。"""
+        if not self._enabled or not self._archive_watch:
+            return
+        try:
+            if not self.start_archive_scan():
+                logger.info("【GDriveTree】归档扫描跳过：已有任务在运行")
+        except Exception:
+            logger.exception("【GDriveTree】启动归档扫描失败")
+
+    def start_archive_scan(self) -> bool:
+        """启动后台归档扫描。"""
+        if not self._enabled or not self._archive_watch:
+            return False
+        if self._archive_lock.locked():
+            return False
+        thread = threading.Thread(
+            target=self.scan_archive,
+            name="GDriveTree-archive",
+            daemon=True,
+        )
+        self._archive_thread = thread
+        thread.start()
+        return True
+
+    def scan_archive(self) -> Dict[str, Any]:
+        """对比宿主归档记录与 archive_link，把缺失的目标增量加入目录树。"""
+        result: Dict[str, Any] = {
+            "scanned": 0,
+            "processed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "busy": False,
+        }
+        if not self._enabled or not self._archive_watch:
+            return result
+        if not self._archive_lock.acquire(blocking=False):
+            result["busy"] = True
+            return result
+        client: Optional[GDriveTreeClient] = None
+        try:
+            source = self._read_source_config()
+            client = GDriveTreeClient(
+                client_id=source["client_id"],
+                client_secret=source["client_secret"],
+                refresh_token=source["refresh_token"],
+            )
+            root = self._resolve_root(client, source)
+            done, retries = self._archive_link_state()
+            archive = ArchiveSource(self._gdrive_storage_names())
+            for record in archive.iter_records(page_size=200, max_pages=200):
+                result["scanned"] += 1
+                if record.history_id and record.history_id in done:
+                    result["skipped"] += 1
+                    continue
+                if record.history_id and retries.get(record.history_id, 0) >= ARCHIVE_MAX_RETRIES:
+                    result["skipped"] += 1
+                    continue
+                if result["processed"] >= ARCHIVE_SCAN_LIMIT:
+                    break
+                try:
+                    nodes = self._nodes_for_archive_record(client, root, source, record)
+                    self._upsert_nodes(nodes)
+                    self._link_update(
+                        record.history_id,
+                        record.dest,
+                        record.dest_storage,
+                        ArchiveSource.target_file_id(record),
+                        "done",
+                        len(nodes),
+                        "",
+                    )
+                    result["processed"] += 1
+                except Exception as err:
+                    result["failed"] += 1
+                    logger.warning(
+                        f"【GDriveTree】归档记录 {record.history_id} 入树失败：{err}"
+                    )
+                    self._link_update(
+                        record.history_id,
+                        record.dest,
+                        record.dest_storage,
+                        ArchiveSource.target_file_id(record),
+                        "failed",
+                        0,
+                        str(err),
+                    )
+            if result["processed"]:
+                self._recount_meta()
+            self._save_archive_status(result)
+            if result["processed"] or result["failed"]:
+                logger.info(f"【GDriveTree】归档扫描完成：{result}")
+            return result
+        except Exception as err:
+            logger.warning(f"【GDriveTree】归档扫描失败：{err}")
+            result["error"] = str(err)
+            self._save_archive_status(result)
+            return result
+        finally:
+            if client is not None:
+                client.close()
+            self._archive_lock.release()
+
+    def _nodes_for_archive_record(
+        self,
+        client: GDriveTreeClient,
+        root: RootInfo,
+        source: Dict[str, str],
+        record: ArchiveRecord,
+    ) -> List[TreeNodeData]:
+        """把一条归档记录转换为待写入的节点（可能多个文件）。"""
+        target_id = ArchiveSource.target_file_id(record)
+        if target_id:
+            return self._nodes_for_target(client, root, source, file_id=target_id)
+        raw_paths = record.files or ([record.dest] if record.dest else [])
+        merged: Dict[str, TreeNodeData] = {}
+        for raw_path in raw_paths:
+            path = self._normalize_archive_path(str(raw_path), record.dest)
+            if not path:
+                continue
+            for node in self._nodes_for_target(client, root, source, path=path):
+                merged[node.file_id] = node
+        if not merged:
+            raise GDriveTreeError("归档记录缺少目标文件信息")
+        return sorted(merged.values(), key=lambda node: (node.depth, node.path))
+
+    @staticmethod
+    def _normalize_archive_path(raw_path: str, dest: str) -> str:
+        """把归档记录中的路径统一成以 / 开头的绝对路径。"""
+        text = str(raw_path or "").strip().replace("\\", "/")
+        if not text:
+            return ""
+        base = str(dest or "").strip().replace("\\", "/")
+        if base:
+            base = base.rstrip("/")
+            if not text.startswith("/"):
+                text = base + "/" + text.lstrip("/")
+            elif not (text == base or text.startswith(base + "/")):
+                # files 里可能是源路径；按文件名落到目标目录下
+                text = base + "/" + PurePosixPath(text).name
+        if not text.startswith("/"):
+            text = "/" + text
+        return text
+
+    def _nodes_for_target(
+        self,
+        client: GDriveTreeClient,
+        root: RootInfo,
+        source: Dict[str, str],
+        *,
+        file_id: str = "",
+        path: str = "",
+    ) -> List[TreeNodeData]:
+        """按 fileid 或虚拟路径获取目标元数据并构建父链节点。"""
+        meta: Optional[Dict[str, Any]] = None
+        if file_id:
+            meta = client.get_file(file_id, FILE_FIELDS)
+        elif path:
+            pure = PurePosixPath(path.rstrip("/"))
+            name = pure.name
+            parent_path = normalize_root_path(str(pure.parent or "/"))
+            parent = self._find_node_by_path(parent_path)
+            if parent is None:
+                raise GDriveTreeError(
+                    f"父目录不在目录树中：{parent_path}；请先刷新目录树"
+                )
+            meta = client.find_child(parent.file_id, name)
+            if meta is None:
+                raise GDriveTreeError(f"云端未找到目标文件：{path}")
+        if not meta:
+            raise GDriveTreeError("缺少目标文件 ID 或路径")
+        return self._nodes_from_metadata(client, meta, root, source)
+
+    def _nodes_from_metadata(
+        self,
+        client: GDriveTreeClient,
+        meta: Dict[str, Any],
+        root: RootInfo,
+        source: Dict[str, str],
+    ) -> List[TreeNodeData]:
+        """拉取父链并在本地裁剪成从根到目标的节点列表。"""
+        target_id = str(meta.get("id") or "")
+        if not target_id:
+            raise GDriveTreeError("目标元数据缺少 file id")
+        chain: List[Dict[str, Any]] = [meta]
+        current = meta
+        seen = {target_id}
+        for _ in range(64):
+            parents = current.get("parents") or []
+            parent_id = str(parents[0]) if parents else ""
+            if not parent_id or parent_id == root.file_id:
+                break
+            if parent_id in seen:
+                raise GDriveTreeError("目标文件的父目录链出现循环")
+            seen.add(parent_id)
+            current = client.get_file(parent_id, FILE_FIELDS)
+            chain.append(current)
+        else:
+            raise GDriveTreeError("目标文件父目录层级过深")
+        root_raw = {
+            "id": root.file_id,
+            "name": root.name or "/",
+            "mimeType": FOLDER_MIME,
+            "parents": [],
+        }
+        files = [root_raw] + list(reversed(chain))
+        nodes, _ = build_tree(
+            files,
+            root_id=root.file_id,
+            root_name=root.name,
+            root_path=normalize_root_path(source["root_path"]),
+            max_nodes=max(1000, self._max_nodes),
+            skip_trashed=False,
+        )
+        if not any(node.file_id == target_id for node in nodes):
+            raise GDriveTreeError("归档目标不在当前目录树根目录下")
+        return nodes
+
+    def _find_node_by_path(self, path: str) -> Optional[TreeNode]:
+        """按目录路径查找已有节点。"""
+        normalized = normalize_root_path(path)
+        try:
+            with self._session() as session:
+                return session.scalar(
+                    select(TreeNode).where(TreeNode.path == normalized).limit(1)
+                )
+        except SQLAlchemyError:
+            logger.debug("【GDriveTree】按路径查询节点失败", exc_info=True)
+            return None
+
+    def _upsert_nodes(self, nodes: List[TreeNodeData]) -> None:
+        """按 file_id 增量写入节点，不删除其它节点。"""
+        if not nodes:
+            return
+        now = datetime.now()
+        with self._session() as session:
+            ids = [node.file_id for node in nodes]
+            existing = {
+                row.file_id: row
+                for row in session.scalars(
+                    select(TreeNode).where(TreeNode.file_id.in_(ids))
+                )
+            }
+            for node in nodes:
+                values = self._node_values(node, now)
+                row = existing.get(node.file_id)
+                if row is None:
+                    session.add(TreeNode(**values))
+                else:
+                    values.pop("created_at", None)
+                    for key, value in values.items():
+                        setattr(row, key, value)
+            session.commit()
+
+    def _link_update(
+        self,
+        history_id: int,
+        dest_path: str,
+        dest_storage: str,
+        dest_file_id: str,
+        status: str,
+        node_count: int,
+        error: str,
+    ) -> None:
+        """写入归档记录处理状态；history_id 为空时不记录。"""
+        try:
+            history_id = int(history_id or 0)
+        except (TypeError, ValueError):
+            history_id = 0
+        if history_id <= 0:
+            return
+        try:
+            with self._session() as session:
+                link = session.scalar(
+                    select(ArchiveLink).where(ArchiveLink.history_id == history_id)
+                )
+                if link is None:
+                    link = ArchiveLink(history_id=history_id)
+                    session.add(link)
+                link.dest_path = str(dest_path or "")[:2048]
+                link.dest_storage = str(dest_storage or "")[:128]
+                link.dest_file_id = str(dest_file_id or "")[:128]
+                link.status = status
+                if status == "failed":
+                    link.retry_count = int(link.retry_count or 0) + 1
+                link.node_count = int(node_count or 0)
+                link.error = str(error or "")[:500]
+                link.updated_at = datetime.now()
+                session.commit()
+        except SQLAlchemyError:
+            logger.exception("【GDriveTree】写入归档处理状态失败")
+
+    def _archive_link_state(self) -> Tuple[set, Dict[int, int]]:
+        """返回已完成的历史 ID 集合与失败重试次数。"""
+        done: set = set()
+        retries: Dict[int, int] = {}
+        try:
+            with self._session() as session:
+                rows = list(session.scalars(select(ArchiveLink)))
+        except SQLAlchemyError:
+            logger.debug("【GDriveTree】读取归档处理状态失败", exc_info=True)
+            return done, retries
+        for row in rows:
+            history_id = int(row.history_id or 0)
+            if history_id <= 0:
+                continue
+            if row.status == "done":
+                done.add(history_id)
+            retries[history_id] = int(row.retry_count or 0)
+        return done, retries
+
+    def _archive_link_counts(self) -> Dict[str, int]:
+        """统计归档记录处理状态。"""
+        counts = {"total": 0, "done": 0, "failed": 0, "pending": 0}
+        try:
+            with self._session() as session:
+                total = int(session.scalar(select(func.count()).select_from(ArchiveLink)) or 0)
+                done = int(session.scalar(
+                    select(func.count()).select_from(ArchiveLink).where(
+                        ArchiveLink.status == "done"
+                    )
+                ) or 0)
+                failed = int(session.scalar(
+                    select(func.count()).select_from(ArchiveLink).where(
+                        ArchiveLink.status == "failed"
+                    )
+                ) or 0)
+        except SQLAlchemyError:
+            return counts
+        counts["total"] = total
+        counts["done"] = done
+        counts["failed"] = failed
+        counts["pending"] = max(0, total - done - failed)
+        return counts
+
+    def _save_archive_status(self, result: Dict[str, Any]) -> None:
+        """保存最近一次归档扫描结果供页面展示。"""
+        payload = dict(result)
+        payload["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.save_data("archive_status", payload)
+        except Exception:
+            logger.debug("【GDriveTree】保存归档扫描状态失败", exc_info=True)
+
+    def _recount_meta(self) -> None:
+        """按节点表重新计算统计，归档增量后调用。"""
+        now = datetime.now()
+        try:
+            with self._session() as session:
+                total = int(session.scalar(
+                    select(func.count()).select_from(TreeNode)
+                ) or 0)
+                dirs = int(session.scalar(
+                    select(func.count()).select_from(TreeNode).where(
+                        TreeNode.is_dir.is_(True)
+                    )
+                ) or 0)
+                total_size = int(session.scalar(
+                    select(func.coalesce(func.sum(TreeNode.size), 0)).select_from(TreeNode).where(
+                        TreeNode.is_dir.is_(False)
+                    )
+                ) or 0)
+                max_depth = int(session.scalar(
+                    select(func.max(TreeNode.depth)).select_from(TreeNode)
+                ) or 0)
+                meta = session.get(TreeMeta, 1)
+                if meta is None:
+                    meta = TreeMeta(id=1)
+                    session.add(meta)
+                meta.node_count = total
+                meta.dir_count = dirs
+                meta.file_count = max(0, total - dirs)
+                meta.total_size = total_size
+                meta.max_depth = max_depth
+                if meta.status in ("idle", "success"):
+                    meta.status = "success"
+                meta.last_success_at = now
+                meta.updated_at = now
+                session.commit()
+        except SQLAlchemyError:
+            logger.exception("【GDriveTree】重算目录树统计失败")
+
+    # ------------------------------------------------------------------
     # 数据库
     # ------------------------------------------------------------------
     def _session(self):
@@ -629,35 +1200,120 @@ class GDriveTree(_PluginBase):
 
     def _save_snapshot(
         self,
-        nodes: List[Any],
+        nodes: List[TreeNodeData],
         stats: TreeStats,
         root: RootInfo,
         source: Dict[str, str],
         pages: int,
         duration: float,
     ) -> None:
-        """在单事务内替换节点并写入成功状态。"""
+        """按配置选择整体替换或按 file_id 增量写库。"""
         now = datetime.now()
-        rows = [
-            {
-                "file_id": node.file_id,
-                "parent_file_id": node.parent_file_id or "",
-                "name": node.name,
-                "mime_type": node.mime_type,
-                "is_dir": node.is_dir,
-                "size": node.size,
-                "modified_time": node.modified_time,
-                "created_time": node.created_time,
-                "path": node.path,
-                "depth": node.depth,
-                "md5": node.md5,
-                "trashed": node.trashed,
-                "shortcut_target_id": node.shortcut_target_id,
-                "created_at": now,
-                "updated_at": now,
-            }
-            for node in nodes
-        ]
+        rows = [self._node_values(node, now) for node in nodes]
+        if self._incremental_write:
+            self._save_snapshot_incremental(
+                nodes, rows, stats, root, source, pages, duration, now
+            )
+        else:
+            self._save_snapshot_replace(
+                rows, stats, root, source, pages, duration, now
+            )
+
+    @staticmethod
+    def _node_values(node: TreeNodeData, now: datetime) -> Dict[str, Any]:
+        """把建树节点转换为数据库行字典。"""
+        return {
+            "file_id": node.file_id,
+            "parent_file_id": node.parent_file_id or "",
+            "name": node.name,
+            "mime_type": node.mime_type,
+            "is_dir": node.is_dir,
+            "size": node.size,
+            "modified_time": node.modified_time,
+            "created_time": node.created_time,
+            "path": node.path,
+            "depth": node.depth,
+            "md5": node.md5,
+            "trashed": node.trashed,
+            "shortcut_target_id": node.shortcut_target_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    @staticmethod
+    def _node_changed(row: TreeNode, node: TreeNodeData) -> bool:
+        """判断已有行与最新节点是否有需要更新的字段。"""
+        checks = (
+            ("parent_file_id", node.parent_file_id or ""),
+            ("name", node.name),
+            ("mime_type", node.mime_type),
+            ("is_dir", bool(node.is_dir)),
+            ("size", int(node.size or 0)),
+            ("modified_time", float(node.modified_time or 0)),
+            ("created_time", float(node.created_time or 0)),
+            ("path", node.path),
+            ("depth", int(node.depth or 0)),
+            ("md5", node.md5 or ""),
+            ("trashed", bool(node.trashed)),
+            ("shortcut_target_id", node.shortcut_target_id or ""),
+        )
+        for attr, new_value in checks:
+            old_value = getattr(row, attr, None)
+            if attr == "parent_file_id":
+                old_value = old_value or ""
+            elif attr in ("size", "depth"):
+                old_value = int(old_value or 0)
+            elif attr in ("modified_time", "created_time"):
+                old_value = float(old_value or 0)
+            elif attr in ("is_dir", "trashed"):
+                old_value = bool(old_value)
+            elif attr in ("md5", "shortcut_target_id"):
+                old_value = old_value or ""
+            if old_value != new_value:
+                return True
+        return False
+
+    def _apply_snapshot_meta(
+        self,
+        meta: TreeMeta,
+        stats: TreeStats,
+        root: RootInfo,
+        source: Dict[str, str],
+        pages: int,
+        duration: float,
+        now: datetime,
+    ) -> None:
+        """更新成功刷新的公共元信息。"""
+        meta.source_plugin_id = self._source_plugin_id
+        meta.root_file_id = root.file_id
+        meta.root_name = root.name
+        meta.root_path = normalize_root_path(source["root_path"])
+        meta.corpora = root.corpora
+        meta.drive_id = root.drive_id
+        meta.status = "success"
+        meta.last_finished_at = now
+        meta.last_success_at = now
+        meta.node_count = stats.node_count
+        meta.dir_count = stats.dir_count
+        meta.file_count = stats.file_count
+        meta.total_size = stats.total_size
+        meta.max_depth = stats.max_depth
+        meta.page_count = pages
+        meta.duration_seconds = round(duration, 3)
+        meta.error = ""
+        meta.updated_at = now
+
+    def _save_snapshot_replace(
+        self,
+        rows: List[Dict[str, Any]],
+        stats: TreeStats,
+        root: RootInfo,
+        source: Dict[str, str],
+        pages: int,
+        duration: float,
+        now: datetime,
+    ) -> None:
+        """整体替换模式：删除旧节点后批量写入。"""
         with self._session() as session:
             session.execute(delete(TreeNode))
             batch = 500
@@ -667,25 +1323,67 @@ class GDriveTree(_PluginBase):
             if meta is None:
                 meta = TreeMeta(id=1)
                 session.add(meta)
-            meta.source_plugin_id = self._source_plugin_id
-            meta.root_file_id = root.file_id
-            meta.root_name = root.name
-            meta.root_path = normalize_root_path(source["root_path"])
-            meta.corpora = root.corpora
-            meta.drive_id = root.drive_id
-            meta.status = "success"
-            meta.last_finished_at = now
-            meta.last_success_at = now
-            meta.node_count = stats.node_count
-            meta.dir_count = stats.dir_count
-            meta.file_count = stats.file_count
-            meta.total_size = stats.total_size
-            meta.max_depth = stats.max_depth
-            meta.page_count = pages
-            meta.duration_seconds = round(duration, 3)
-            meta.error = ""
-            meta.updated_at = now
+            self._apply_snapshot_meta(
+                meta, stats, root, source, pages, duration, now
+            )
             session.commit()
+
+    def _save_snapshot_incremental(
+        self,
+        nodes: List[TreeNodeData],
+        rows: List[Dict[str, Any]],
+        stats: TreeStats,
+        root: RootInfo,
+        source: Dict[str, str],
+        pages: int,
+        duration: float,
+        now: datetime,
+    ) -> None:
+        """增量模式：删除缺失、插入新增、只更新变化行。"""
+        with self._session() as session:
+            existing = {
+                row.file_id: row
+                for row in session.scalars(select(TreeNode))
+            }
+            new_ids = {node.file_id for node in nodes}
+            missing = [file_id for file_id in existing if file_id not in new_ids]
+            for start in range(0, len(missing), 500):
+                session.execute(
+                    delete(TreeNode).where(
+                        TreeNode.file_id.in_(missing[start:start + 500])
+                    )
+                )
+            inserts: List[Dict[str, Any]] = []
+            updates: List[Dict[str, Any]] = []
+            for node, row in zip(nodes, rows):
+                old = existing.get(node.file_id)
+                if old is None:
+                    inserts.append(row)
+                elif self._node_changed(old, node):
+                    update_row = dict(row)
+                    update_row["id"] = old.id
+                    update_row.pop("created_at", None)
+                    updates.append(update_row)
+            for start in range(0, len(inserts), 500):
+                session.bulk_insert_mappings(
+                    TreeNode, inserts[start:start + 500]
+                )
+            for start in range(0, len(updates), 500):
+                session.bulk_update_mappings(
+                    TreeNode, updates[start:start + 500]
+                )
+            meta = session.get(TreeMeta, 1)
+            if meta is None:
+                meta = TreeMeta(id=1)
+                session.add(meta)
+            self._apply_snapshot_meta(
+                meta, stats, root, source, pages, duration, now
+            )
+            session.commit()
+        logger.info(
+            f"【GDriveTree】增量写库：删除={len(missing)}，插入={len(inserts)}，"
+            f"更新={len(updates)}，未变化={len(rows) - len(inserts) - len(updates)}"
+        )
 
     def _safe_failed(self, status: str, error: str) -> None:
         """写入失败/取消状态，保留旧节点。"""
@@ -849,6 +1547,20 @@ class GDriveTree(_PluginBase):
                 "auth": "bear",
                 "summary": "清空目录树数据",
             },
+            {
+                "path": "/archive/scan",
+                "endpoint": self.api_archive_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即扫描归档记录",
+            },
+            {
+                "path": "/archive/status",
+                "endpoint": self.api_archive_status,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "归档增量状态",
+            },
         ]
 
     def api_refresh(self) -> Dict[str, Any]:
@@ -952,6 +1664,41 @@ class GDriveTree(_PluginBase):
         logger.info(f"【GDriveTree】已清空目录树节点：{deleted} 条")
         return {"success": True, "message": f"已清空 {deleted} 条节点", "data": {"deleted": deleted}}
 
+    def api_archive_scan(self) -> Dict[str, Any]:
+        """启动一次归档记录扫描。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用", "data": None}
+        if not self._archive_watch:
+            return {"success": False, "message": "未开启归档监控", "data": None}
+        try:
+            started = self.start_archive_scan()
+        except Exception as err:
+            logger.exception("【GDriveTree】启动归档扫描失败")
+            return {
+                "success": False,
+                "message": f"启动归档扫描失败：{err}",
+                "data": None,
+            }
+        return {
+            "success": True,
+            "message": "归档扫描已启动" if started else "归档扫描正在运行",
+            "data": {"started": started},
+        }
+
+    def api_archive_status(self) -> Dict[str, Any]:
+        """返回归档增量处理状态。"""
+        last_scan = self.get_data("archive_status")
+        return {
+            "success": True,
+            "message": "归档状态已刷新",
+            "data": {
+                "enabled": self._archive_watch,
+                "interval_minutes": self._archive_interval_minutes,
+                "counts": self._archive_link_counts(),
+                "last_scan": last_scan if isinstance(last_scan, dict) else {},
+            },
+        }
+
     # ------------------------------------------------------------------
     # 页面
     # ------------------------------------------------------------------
@@ -990,6 +1737,21 @@ class GDriveTree(_PluginBase):
         )
         contents.append(self._alert("info", stats_text))
 
+        if self._archive_watch:
+            counts = self._archive_link_counts()
+            last_scan = self.get_data("archive_status")
+            last_scan = last_scan if isinstance(last_scan, dict) else {}
+            archive_text = (
+                f"归档增量：已处理 {counts['done']}，失败 {counts['failed']}，"
+                f"待处理 {counts['pending']}；最近扫描 "
+                f"{last_scan.get('time') or '-'}：扫描 {last_scan.get('scanned', 0)}，"
+                f"新增 {last_scan.get('processed', 0)}，"
+                f"失败 {last_scan.get('failed', 0)}。"
+            )
+        else:
+            archive_text = "归档增量：未开启。"
+        contents.append(self._alert("info", archive_text))
+
         if meta.get("root_file_id"):
             contents.append(self._alert(
                 "info",
@@ -1011,6 +1773,7 @@ class GDriveTree(_PluginBase):
         buttons: List[dict] = [
             self._page_button("立即刷新", "mdi-refresh", "/refresh"),
             self._page_button("刷新状态", "mdi-sync", "/status"),
+            self._page_button("扫描归档", "mdi-history", "/archive/scan"),
             self._page_button("清空数据", "mdi-delete-sweep", "/clear"),
         ]
         contents.append({

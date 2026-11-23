@@ -347,3 +347,84 @@ idle -> running -> success
 - 发布：`package.v3.json` 新增 `GDriveTree`，`version=1.0.1`，`icon="gdrive.png"`（复用现有图标，不新增二进制），`system_version=">=3.0.0"`，`labels="网盘"`。
 - 回滚：插件停用即停止定时任务；`/clear` 可清空节点；卸载插件不影响 `GDriveStorage` 配置与宿主存储。
 - 不在 `GDriveStorage` 中新增任何字段或行为，保持单向依赖（GDriveTree 读 GDriveStorage 配置）。
+
+## 11. 增量写库（v1.1.0）
+
+配置 `incremental_write`（默认 true）。
+
+`_save_snapshot()` 仍先在内存完成全量拉取与建树，再按开关分派：
+
+- **整体替换**（关闭）：`delete(TreeNode)` + 分批 `bulk_insert_mappings`。
+- **增量写库**（开启）：
+  1. `select(TreeNode)` 读取现有行，按 `file_id` 建映射。
+  2. 新树中不存在的 `file_id` → 分批 `delete ... where file_id in (...)`。
+  3. 新树中存在、数据库不存在 → 分批 `bulk_insert_mappings`。
+  4. 两边都存在但字段变化 → `bulk_update_mappings`（携带主键 `id`，不覆盖 `created_at`）。
+  5. 未变化行不写。
+  6. `tree_meta` 统计与上述操作同事务提交；异常回滚。
+
+比较字段：`parent_file_id`、`name`、`mime_type`、`is_dir`、`size`、`modified_time`、`created_time`、`path`、`depth`、`md5`、`trashed`、`shortcut_target_id`。
+
+## 12. 归档增量（v1.1.0）
+
+### 12.1 宿主耦合
+
+新增 `archive_source.py`，集中只读访问宿主整理历史：
+
+```python
+from app.db.oper.transferhistory import TransferHistoryOper
+from app.schemas.query import QueryPageRequest, TransferHistoryFilter
+oper.query(TransferHistoryFilter(), QueryPageRequest(page=..., count=200))
+```
+
+- 宿主未在 `app.sdk` 暴露整理历史，因此这是受控的内部导入；失败时抛 `GDriveTreeError`，插件其它功能不受影响。
+- 过滤：`status is not False`，且 `dest_storage` 属于 `{"gdrive", GDriveStorage.display_name}`。
+- 输出 `ArchiveRecord(history_id, dest, dest_storage, dest_fileitem, files)`。
+
+### 12.2 表 `archive_link`
+
+`history_id`、`dest_path`、`dest_storage`、`dest_file_id`、`status`、`node_count`、`retry_count`、`error`、时间戳。`history_id` 索引；应用层去重，不依赖数据库唯一约束（避免已有表无法迁移）。
+
+### 12.3 触发
+
+- **事件**：`@eventmanager.register(EventType.TransferComplete)`。payload 的 `transferinfo.target_item`（或 `target_diritem`）带 `storage/fileid/path`；命中 gdrive 时启动后台线程，使用 `_archive_lock` 非阻塞串行化。
+- **轮询**：`get_service()` 在 `archive_watch` 开启时注册 `interval`（`archive_poll_interval_minutes`）。扫描流程：
+  1. 读取 `archive_link` 的 done 集合与失败重试次数。
+  2. 分页遍历宿主归档记录（每页 200，最多 200 页）。
+  3. 跳过 done / 重试 ≥3 / 单轮超过 50 条。
+  4. 成功写 `done`，失败写 `failed` 并累加 `retry_count`。
+  5. 有新增时重算 `tree_meta` 统计。
+
+### 12.4 单条入树
+
+- 优先 `dest_fileitem.fileid`：`get_file(fileid)` 拿元数据。
+- 否则按 `files`/`dest` 路径：在 `tree_node` 中按目录路径找父节点 → `find_child(parent_id, name)` 查询云端元数据。
+- 父链：从目标元数据沿第一个 `parents` 向上 `get_file`，直到配置根或 64 层；把根、父链、目标一起交给 `build_tree()` 裁剪，得到从根到目标的节点。
+- `_upsert_nodes()` 按 `file_id` 更新或插入，不删除其它节点。
+- 目标不在配置根子树下时抛错并记录 `failed`。
+
+### 12.5 配置 / API / 页面
+
+- 配置：`incremental_write`、`archive_watch`、`archive_poll_interval_minutes`（1–1440，默认 5）。
+- API：`/archive/scan`、`/archive/status`，严格三键 envelope。
+- 页面：归档处理统计（done/failed/pending）、最近扫描结果、按钮「扫描归档」。
+
+### 12.6 错误矩阵（增量）
+
+| 条件 | 行为 |
+| --- | --- |
+| 宿主无整理历史接口 | 轮询记录错误，事件路径仍可用 |
+| 归档目标父目录不在树中 | 记录 `failed`，下轮重试 |
+| 云端按名称查不到目标 | 记录 `failed`，下轮重试 |
+| 目标不在配置根子树 | 记录 `failed`，不写节点 |
+| 同一历史重复到达 | `archive_link` done 跳过；节点按 `file_id` 幂等 |
+| 事件与轮询并发 | `_archive_lock` 非阻塞，冲突方让位给另一种触发 |
+| 失败超过 3 次 | 轮询跳过，保留错误供排查 |
+
+### 12.7 测试
+
+- 增量写库：删除/插入/更新/未变化计数与行 ID 稳定性。
+- 归档事件：按 fileid 拉父链入树、写 `done`。
+- 归档轮询：首次处理、二次跳过、失败记录重试次数。
+- `get_service()`：全量与归档开关独立注册。
+- 客户端 `find_child()`：名称查询参数与返回。

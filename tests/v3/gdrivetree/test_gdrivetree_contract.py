@@ -79,7 +79,7 @@ def test_plugin_identity_attributes() -> None:
     class_node = _class_node(_tree(), "GDriveTree")
     version = _class_attr(class_node, "plugin_version")
     prefix = _class_attr(class_node, "plugin_config_prefix")
-    assert isinstance(version, ast.Constant) and version.value == "1.0.1"
+    assert isinstance(version, ast.Constant) and version.value == "1.1.0"
     assert isinstance(prefix, ast.Constant) and prefix.value == "gdrivetree_"
 
 
@@ -126,9 +126,13 @@ def test_database_models_are_declared() -> None:
         for element in list_returns[0].elts
         if isinstance(element, ast.Name)
     }
-    assert names == {"TreeMeta", "TreeNode"}
+    assert names == {"TreeMeta", "TreeNode", "ArchiveLink"}
 
-    for model_name, table_name in (("TreeMeta", "tree_meta"), ("TreeNode", "tree_node")):
+    for model_name, table_name in (
+        ("TreeMeta", "tree_meta"),
+        ("TreeNode", "tree_node"),
+        ("ArchiveLink", "archive_link"),
+    ):
         model = _class_node(tree, model_name)
         base_names = {base.id for base in model.bases if isinstance(base, ast.Name)}
         assert "_PluginDBBase" in base_names, f"{model_name} must inherit plugin base"

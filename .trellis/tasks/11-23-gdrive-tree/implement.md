@@ -71,7 +71,20 @@ python -c "import json; json.load(open('package.v3.json', encoding='utf-8'))"
 git diff --check
 ```
 
-## 5. 完成标准
+## 5. v1.1.0 增量能力
+
+- [x] 配置 `incremental_write` / `archive_watch` / `archive_poll_interval_minutes`。
+- [x] 新增 `ArchiveLink` 表并交给宿主建表。
+- [x] `_save_snapshot` 分派整体替换 / 增量写库（删除缺失、插入新增、更新变化）。
+- [x] 新增 `archive_source.py`，只读宿主整理历史并过滤 gdrive 目标。
+- [x] 监听 `EventType.TransferComplete`，后台线程增量入树。
+- [x] 注册归档轮询服务，对比 `archive_link` 去重并限制重试。
+- [x] 按 fileid 拉父链，或按路径定位父目录 + `find_child` 查询。
+- [x] 页面/API 增加归档统计、扫描按钮、`/archive/scan`、`/archive/status`。
+- [x] 测试：增量写库、归档事件、轮询去重、失败重试、服务开关、`find_child`。
+- [x] 版本升至 1.1.0 并更新 `package.v3.json` history。
+
+## 6. 完成标准
 
 - [ ] 全部验收标准（`prd.md`）可核对。
 - [ ] 本地测试全绿。

@@ -323,6 +323,40 @@ class GDriveTreeClient:
             seen_tokens.add(token_text)
             page_token = token_text
 
+    def find_child(self, parent_id: str, name: str) -> Optional[Dict[str, Any]]:
+        """
+        在指定目录下按名称查找子项（用于归档记录只提供路径时补元数据）。
+
+        :param parent_id: 父目录 ID
+        :param name: 文件/目录名
+        :return: 元数据；不存在返回 None
+        """
+        query = (
+            f"'{self._escape_query(parent_id)}' in parents "
+            f"and name = '{self._escape_query(name)}' and trashed = false"
+        )
+        params: Dict[str, Any] = {
+            "q": query,
+            "fields": f"files({FILE_FIELDS})",
+            "pageSize": 100,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "corpora": "allDrives",
+        }
+        data = self._json(
+            self._request("GET", f"{DRIVE_API}/files", params=params)
+        )
+        files = data.get("files") or []
+        for item in files:
+            if isinstance(item, dict):
+                return item
+        return None
+
+    @staticmethod
+    def _escape_query(value: Any) -> str:
+        """转义 Drive 查询字符串中的反斜杠和单引号。"""
+        return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
     def close(self) -> None:
         """关闭传输层。"""
         try:
