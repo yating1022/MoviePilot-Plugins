@@ -30,8 +30,12 @@ from .errors import GDriveTreeAuthError, GDriveTreeCancelled, GDriveTreeError
 from .gdrive_tree_client import FILE_FIELDS, GDriveTreeClient, RootInfo
 from .tree_builder import (
     FOLDER_MIME,
+    SHORTCUT_MIME,
     TreeStats,
     TreeNodeData,
+    _is_native_doc,
+    _parse_size,
+    _parse_time,
     build_tree,
     normalize_root_path,
 )
@@ -162,6 +166,15 @@ def _clamp_int(value: Any, minimum: int, maximum: int, default: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+def _join_child_path(parent_path: str, name: str, is_dir: bool) -> str:
+    """在树中父路径下拼接子节点路径；目录保留结尾斜杠。"""
+    base = parent_path or "/"
+    child = f"{base.rstrip('/')}/{name}" if base != "/" else f"/{name}"
+    if is_dir and not child.endswith("/"):
+        child += "/"
+    return child
+
+
 def _format_size(size: Any) -> str:
     """把字节数格式化为易读文本。"""
     value = float(max(0, int(size or 0)))
@@ -203,7 +216,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -830,7 +843,9 @@ class GDriveTree(_PluginBase):
                 refresh_token=source["refresh_token"],
             )
             root = self._resolve_root(client, source)
-            nodes = self._nodes_for_target(client, root, source, file_id=file_id, path=path)
+            nodes = self._resolve_archive_nodes(
+                client, root, source, file_id=file_id, path=path
+            )
             self._upsert_nodes(nodes)
             self._link_update(
                 history_id, path, storage, file_id, "done", len(nodes), ""
@@ -959,18 +974,40 @@ class GDriveTree(_PluginBase):
     ) -> List[TreeNodeData]:
         """把一条归档记录转换为待写入的节点（可能多个文件）。"""
         target_id = ArchiveSource.target_file_id(record)
+        errors: List[str] = []
         if target_id:
-            return self._nodes_for_target(client, root, source, file_id=target_id)
-        raw_paths = record.files or ([record.dest] if record.dest else [])
+            try:
+                return self._nodes_for_target(
+                    client, root, source, file_id=target_id
+                )
+            except GDriveTreeError as err:
+                errors.append(f"按文件 ID {target_id} 解析失败：{err}")
+        raw_paths = [str(path) for path in record.files if str(path).strip()]
+        if not raw_paths:
+            item = record.dest_fileitem or {}
+            item_path = str(item.get("path") or "").strip()
+            item_name = str(item.get("name") or item.get("basename") or "").strip()
+            if item_path:
+                raw_paths = [item_path]
+            elif item_name and record.dest:
+                raw_paths = [f"{record.dest.rstrip('/')}/{item_name}"]
+            elif record.dest:
+                raw_paths = [record.dest]
         merged: Dict[str, TreeNodeData] = {}
         for raw_path in raw_paths:
             path = self._normalize_archive_path(str(raw_path), record.dest)
             if not path:
                 continue
-            for node in self._nodes_for_target(client, root, source, path=path):
-                merged[node.file_id] = node
+            try:
+                node = self._node_for_tree_path(client, path)
+            except GDriveTreeError as err:
+                errors.append(f"按路径 {path} 解析失败：{err}")
+                continue
+            merged[node.file_id] = node
         if not merged:
-            raise GDriveTreeError("归档记录缺少目标文件信息")
+            raise GDriveTreeError(
+                "；".join(errors[:4]) or "归档记录缺少目标文件信息"
+            )
         return sorted(merged.values(), key=lambda node: (node.depth, node.path))
 
     @staticmethod
@@ -1008,17 +1045,100 @@ class GDriveTree(_PluginBase):
             pure = PurePosixPath(path.rstrip("/"))
             name = pure.name
             parent_path = normalize_root_path(str(pure.parent or "/"))
-            parent = self._find_node_by_path(parent_path)
+            parent = self._find_parent_node(path)
             if parent is None:
                 raise GDriveTreeError(
                     f"父目录不在目录树中：{parent_path}；请先刷新目录树"
                 )
-            meta = client.find_child(parent.file_id, name)
+            meta = client.find_child(
+                parent.shortcut_target_id or parent.file_id, name
+            )
             if meta is None:
                 raise GDriveTreeError(f"云端未找到目标文件：{path}")
         if not meta:
             raise GDriveTreeError("缺少目标文件 ID 或路径")
         return self._nodes_from_metadata(client, meta, root, source)
+
+    def _resolve_archive_nodes(
+        self,
+        client: GDriveTreeClient,
+        root: RootInfo,
+        source: Dict[str, str],
+        *,
+        file_id: str = "",
+        path: str = "",
+    ) -> List[TreeNodeData]:
+        """优先按文件 ID 解析；失败后按目录树中的父路径定位目标。"""
+        errors: List[str] = []
+        if file_id:
+            try:
+                return self._nodes_for_target(
+                    client, root, source, file_id=file_id
+                )
+            except GDriveTreeError as err:
+                errors.append(f"按文件 ID {file_id} 解析失败：{err}")
+        if path:
+            try:
+                return [self._node_for_tree_path(client, path)]
+            except GDriveTreeError as err:
+                errors.append(f"按路径 {path} 解析失败：{err}")
+        raise GDriveTreeError("；".join(errors) or "缺少目标文件信息")
+
+    def _node_for_tree_path(
+        self, client: GDriveTreeClient, path: str
+    ) -> TreeNodeData:
+        """
+        以目录树中已存在的父目录为锚点，按文件名向云端查询目标节点。
+
+        快捷方式目录使用其目标目录 ID 查询子项，避免真实父链不在树根下时失败。
+        """
+        pure = PurePosixPath(str(path or "").rstrip("/"))
+        name = pure.name
+        if not name:
+            raise GDriveTreeError(f"目标路径缺少文件名：{path}")
+        parent_path = normalize_root_path(str(pure.parent or "/"))
+        parent = self._find_parent_node(path)
+        if parent is None:
+            raise GDriveTreeError(f"父目录不在目录树中：{parent_path}")
+        meta = client.find_child(
+            parent.shortcut_target_id or parent.file_id, name
+        )
+        if meta is None:
+            raise GDriveTreeError(f"云端未找到目标：{path}")
+        target_id = str(meta.get("id") or "")
+        if not target_id:
+            raise GDriveTreeError(f"目标元数据缺少文件 ID：{path}")
+        mime_type = str(meta.get("mimeType") or "")
+        shortcut_target = ""
+        shortcut_is_dir = False
+        if mime_type == SHORTCUT_MIME:
+            details = meta.get("shortcutDetails") or {}
+            shortcut_target = str(details.get("targetId") or "")
+            shortcut_is_dir = str(
+                details.get("targetMimeType") or ""
+            ) == FOLDER_MIME
+        is_dir = mime_type == FOLDER_MIME or shortcut_is_dir
+        size = (
+            0
+            if (is_dir or _is_native_doc(mime_type))
+            else _parse_size(meta.get("size"))
+        )
+        display_name = str(meta.get("name") or name)
+        return TreeNodeData(
+            file_id=target_id,
+            parent_file_id=parent.file_id,
+            name=display_name,
+            mime_type=mime_type,
+            is_dir=is_dir,
+            size=size,
+            modified_time=_parse_time(meta.get("modifiedTime")),
+            created_time=_parse_time(meta.get("createdTime")),
+            path=_join_child_path(parent.path, display_name, is_dir),
+            depth=int(parent.depth or 0) + 1,
+            md5=str(meta.get("md5Checksum") or ""),
+            trashed=bool(meta.get("trashed")),
+            shortcut_target_id=shortcut_target,
+        )
 
     def _nodes_from_metadata(
         self,
@@ -1076,6 +1196,24 @@ class GDriveTree(_PluginBase):
         except SQLAlchemyError:
             logger.debug("【GDriveTree】按路径查询节点失败", exc_info=True)
             return None
+
+    def _find_parent_node(self, path: str) -> Optional[TreeNode]:
+        """
+        从目标父路径由深到浅查找树中已存在的目录。
+
+        归档路径可能带本地挂载前缀（如 ``/workspace``）而树路径没有，
+        逐级去掉前导目录后仍能定位到真正的父目录。
+        """
+        pure = PurePosixPath(str(path or "").rstrip("/"))
+        parts = [
+            part for part in pure.parent.parts if part not in ("/", "")
+        ]
+        for start in range(0, len(parts) + 1):
+            candidate = "/" + "/".join(parts[start:]) + "/"
+            node = self._find_node_by_path(candidate)
+            if node is not None:
+                return node
+        return None
 
     def _upsert_nodes(
         self, nodes: List[TreeNodeData]

@@ -18,6 +18,7 @@ PLUGIN_DIR = REPO_ROOT / "plugins.v3" / "gdrivetree"
 PLUGIN_PATH = PLUGIN_DIR / "__init__.py"
 PACKAGE_NAME = "gdrivetree_plugin_under_test"
 FOLDER = "application/vnd.google-apps.folder"
+SHORTCUT = "application/vnd.google-apps.shortcut"
 STUB_NAMES = (
     "app",
     "app.schemas",
@@ -615,6 +616,70 @@ def test_archive_event_inserts_parent_chain(plugin_module: Any, monkeypatch: Any
     assert {"root", "d1", "f1"} <= set(rows)
     assert rows["f1"].path == "/Movies/a.mkv"
     assert rows["f1"].parent_file_id == "d1"
+    assert link is not None and link.status == "done"
+
+
+def test_archive_event_falls_back_to_tree_path_for_shortcut(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """真实父链不在树根下时，按树中快捷方式路径定位归档文件。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {
+            "id": "sc",
+            "name": "Shared",
+            "mimeType": SHORTCUT,
+            "parents": ["root"],
+            "shortcutDetails": {"targetId": "td", "targetMimeType": FOLDER},
+        },
+        {"id": "td", "name": "Target", "mimeType": FOLDER, "parents": []},
+        {
+            "id": "d2",
+            "name": "Shows",
+            "mimeType": FOLDER,
+            "parents": ["td"],
+        },
+    ]
+    _save_files(plugin_module, instance, seed)
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "sc": {
+            "id": "sc",
+            "name": "Shared",
+            "mimeType": SHORTCUT,
+            "parents": ["root"],
+            "shortcutDetails": {"targetId": "td", "targetMimeType": FOLDER},
+        },
+        "td": {"id": "td", "name": "Target", "mimeType": FOLDER, "parents": []},
+        "d2": {"id": "d2", "name": "Shows", "mimeType": FOLDER, "parents": ["td"]},
+        "f9": {
+            "id": "f9",
+            "name": "a.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["d2"],
+            "size": "10",
+        },
+    }
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target("f9", "/workspace/Shared/Shows/a.mkv", 43)
+    with instance._session() as session:
+        row = session.scalar(
+            select(plugin_module.TreeNode).where(
+                plugin_module.TreeNode.file_id == "f9"
+            )
+        )
+        link = session.scalar(
+            select(plugin_module.ArchiveLink).where(
+                plugin_module.ArchiveLink.history_id == 43
+            )
+        )
+    assert row is not None
+    assert row.path == "/Shared/Shows/a.mkv"
+    assert row.parent_file_id == "d2"
     assert link is not None and link.status == "done"
 
 

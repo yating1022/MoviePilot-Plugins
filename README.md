@@ -52,7 +52,7 @@ MoviePilot 三方插件仓库（仅支持 V3）：https://github.com/yating1022/
 | 项目 | 值 |
 | --- | --- |
 | 插件 ID | `GDriveTree` |
-| 版本 | 1.2.2 |
+| 版本 | 1.2.3 |
 | 标签 | 网盘 |
 | 系统要求 | MoviePilot >= 3.0.0 |
 
