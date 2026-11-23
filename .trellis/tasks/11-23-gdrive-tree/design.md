@@ -35,7 +35,7 @@ tests/v3/gdrivetree/
 | `max_nodes` | int | 200000 | 单次最大入库节点数 |
 | `page_size` | int | 20 | 详情页每页节点数，5–100 |
 
-`plugin_config_prefix = "gdrivetree_"`，`plugin_version = "1.0.0"`。
+`plugin_config_prefix = "gdrivetree_"`，`plugin_version = "1.0.1"`。
 
 配置归一化：所有数值经 `_clamp_int`；`source_plugin_id` 去空白，空则回退 `GDriveStorage`。
 
@@ -344,6 +344,6 @@ idle -> running -> success
 
 ## 10. 兼容、发布与回滚
 
-- 发布：`package.v3.json` 新增 `GDriveTree`，`version=1.0.0`，`icon="gdrive.png"`（复用现有图标，不新增二进制），`system_version=">=3.0.0"`，`labels="网盘"`。
+- 发布：`package.v3.json` 新增 `GDriveTree`，`version=1.0.1`，`icon="gdrive.png"`（复用现有图标，不新增二进制），`system_version=">=3.0.0"`，`labels="网盘"`。
 - 回滚：插件停用即停止定时任务；`/clear` 可清空节点；卸载插件不影响 `GDriveStorage` 配置与宿主存储。
 - 不在 `GDriveStorage` 中新增任何字段或行为，保持单向依赖（GDriveTree 读 GDriveStorage 配置）。

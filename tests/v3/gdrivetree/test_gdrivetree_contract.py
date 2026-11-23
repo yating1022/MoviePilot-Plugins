@@ -79,7 +79,7 @@ def test_plugin_identity_attributes() -> None:
     class_node = _class_node(_tree(), "GDriveTree")
     version = _class_attr(class_node, "plugin_version")
     prefix = _class_attr(class_node, "plugin_config_prefix")
-    assert isinstance(version, ast.Constant) and version.value == "1.0.0"
+    assert isinstance(version, ast.Constant) and version.value == "1.0.1"
     assert isinstance(prefix, ast.Constant) and prefix.value == "gdrivetree_"
 
 

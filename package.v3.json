@@ -51,12 +51,13 @@
     "name": "Google Drive 目录树",
     "description": "复用 Google Drive 存储插件的授权配置，一次性分页拉取文件元数据并在本地按根目录裁剪建树，目录树持久化到插件自有数据库，支持手动与定时刷新、分页浏览和搜索。",
     "labels": "网盘",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "gdrive.png",
     "author": "yating1022",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.1": "修复共享文件夹/共享盘只抓到根节点：无 driveId 时改用 corpora=allDrives，并展开目录快捷方式；日志增加根解析与拉取统计。",
       "v1.0.0": "初始版本：复用 GDriveStorage 配置，files.list 全量拉取后按根目录裁剪建树，插件自有 tree_node/tree_meta 表，支持手动/定时刷新、分页浏览、搜索与清空。"
     }
   }
