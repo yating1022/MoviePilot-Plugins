@@ -57,10 +57,13 @@ class _StubEventManager:
 
 
 class _StubLogger:
-    """吞掉日志的宿主 logger 替身。"""
+    """记录日志的宿主 logger 替身。"""
+
+    def __init__(self) -> None:
+        self.messages: List[str] = []
 
     def debug(self, *args: Any, **kwargs: Any) -> None:
-        pass
+        self.messages.append(" ".join(str(arg) for arg in args))
 
     info = debug
     warning = debug
@@ -312,6 +315,7 @@ def test_event_adds_and_removes_strm(tmp_path: Path, plugin_module: Any) -> None
     written = tmp_path / "out" / "A" / "a.strm"
     assert written.exists()
 
+    plugin_module.logger.messages.clear()
     added = {
         "file_id": "f2",
         "name": "b.mkv",
@@ -322,10 +326,15 @@ def test_event_adds_and_removes_strm(tmp_path: Path, plugin_module: Any) -> None
     }
     _run(instance, {"kind": "event", "payload": {"added": [added]}}, plugin_module)
     assert (tmp_path / "out" / "A" / "b.strm").exists()
+    logs = "\n".join(plugin_module.logger.messages)
+    assert "新增 STRM" in logs
+    assert "A/b.strm" in logs
 
+    plugin_module.logger.messages.clear()
     removed = {"file_id": "f1", "path": "/A/a.mkv"}
     _run(instance, {"kind": "event", "payload": {"removed": [removed]}}, plugin_module)
     assert not written.exists()
+    assert "删除 STRM" in "\n".join(plugin_module.logger.messages)
     assert instance._load_meta()["removed_count"] == 1
 
 
@@ -384,6 +393,7 @@ def test_handler_filters_other_plugins(tmp_path: Path, plugin_module: Any) -> No
     instance.on_plugin_triggered(_event({"added": []}))
     job = instance._queue.get_nowait()
     assert job["kind"] == "event"
+    assert "收到目录树事件" in "\n".join(plugin_module.logger.messages)
 
 
 def test_invalid_template_aborts_without_writing(

@@ -79,7 +79,7 @@ def test_plugin_identity_attributes() -> None:
     class_node = _class_node(_tree(), "GDriveStrm")
     version = _class_attr(class_node, "plugin_version")
     prefix = _class_attr(class_node, "plugin_config_prefix")
-    assert isinstance(version, ast.Constant) and version.value == "1.0.0"
+    assert isinstance(version, ast.Constant) and version.value == "1.0.1"
     assert isinstance(prefix, ast.Constant) and prefix.value == "gdrivestrm_"
 
 
@@ -155,8 +155,8 @@ def test_package_entry_matches_plugin() -> None:
     """package.v3.json 的版本、历史与图标必须一致。"""
     manifest = json.loads(PACKAGE_PATH.read_text(encoding="utf-8"))
     entry = manifest["GDriveStrm"]
-    assert entry["version"] == "1.0.0"
-    assert "v1.0.0" in entry["history"]
+    assert entry["version"] == "1.0.1"
+    assert "v1.0.1" in entry["history"]
     assert (ICONS_DIR / entry["icon"]).exists()
 
 

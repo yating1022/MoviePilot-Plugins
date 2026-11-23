@@ -57,10 +57,13 @@ class _StubEventManager:
 
 
 class _StubLogger:
-    """吞掉日志的宿主 logger 替身。"""
+    """记录日志的宿主 logger 替身。"""
+
+    def __init__(self) -> None:
+        self.messages: List[str] = []
 
     def debug(self, *args: Any, **kwargs: Any) -> None:
-        pass
+        self.messages.append(" ".join(str(arg) for arg in args))
 
     info = debug
     warning = debug
@@ -696,9 +699,13 @@ def test_refresh_publishes_targeted_tree_event(plugin_module: Any) -> None:
         {"enabled": True, "strm_notify": True, "strm_plugin_id": "GDriveStrm"},
     )
     plugin_module.eventmanager.events.clear()
+    plugin_module.logger.messages.clear()
     _save(plugin_module, instance)
     events = plugin_module.eventmanager.events
     assert len(events) == 1
+    logs = "\n".join(plugin_module.logger.messages)
+    assert "发送目录树事件" in logs
+    assert "GDriveStrm" in logs
     etype, payload = events[0]
     assert etype == plugin_module.EventType.PluginTriggered
     assert payload["plugin_id"] == "GDriveTree"

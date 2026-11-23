@@ -203,7 +203,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -1265,7 +1265,10 @@ class GDriveTree(_PluginBase):
 
     def _publish_tree_change(self, change: TreeChangeSet) -> None:
         """把目录树变化定向通知 STRM 插件；通知失败不影响刷新。"""
-        if not self._enabled or not self._strm_notify:
+        if not self._enabled:
+            return
+        if not self._strm_notify:
+            logger.debug("【GDriveTree】未开启「通知 STRM 插件」，跳过事件")
             return
         target = str(self._strm_plugin_id or "").strip()
         if not target:
@@ -1273,11 +1276,11 @@ class GDriveTree(_PluginBase):
         try:
             payload = build_payload(self._instance_id(), target, change)
             eventmanager.send_event(EventType.PluginTriggered, payload)
-            logger.debug(
-                f"【GDriveTree】已通知 STRM 插件 {target}："
+            logger.info(
+                f"【GDriveTree】发送目录树事件 → {target}："
                 f"kind={change.kind}，新增={len(change.added)}，"
                 f"更新={len(change.updated)}，删除={len(change.removed)}，"
-                f"全量={change.full}"
+                f"full={change.full}，节点数={change.node_count}"
             )
         except Exception:
             logger.warning("【GDriveTree】发送目录树变化事件失败", exc_info=True)
@@ -1304,6 +1307,8 @@ class GDriveTree(_PluginBase):
             )
         if change.full or change.node_count:
             self._publish_tree_change(change)
+        else:
+            logger.debug("【GDriveTree】目录树无变化，跳过事件通知")
         return change
 
     @staticmethod
@@ -1414,7 +1419,7 @@ class GDriveTree(_PluginBase):
                 meta, stats, root, source, pages, duration, now
             )
             session.commit()
-        return full_signal("refresh")
+        return full_signal("refresh", len(rows))
 
     def _save_snapshot_incremental(
         self,
@@ -1760,7 +1765,7 @@ class GDriveTree(_PluginBase):
             logger.exception("【GDriveTree】清空目录树失败")
             return {"success": False, "message": "清空失败，请查看日志", "data": None}
         self._page = 1
-        self._publish_tree_change(full_signal("clear"))
+        self._publish_tree_change(full_signal("clear", deleted))
         logger.info(f"【GDriveTree】已清空目录树节点：{deleted} 条")
         return {"success": True, "message": f"已清空 {deleted} 条节点", "data": {"deleted": deleted}}
 

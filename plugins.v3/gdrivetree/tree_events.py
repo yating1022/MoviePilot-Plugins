@@ -109,14 +109,19 @@ def _as_list(value: Iterable[Any]) -> List[Any]:
     return value if isinstance(value, list) else list(value)
 
 
-def full_signal(kind: str) -> TreeChangeSet:
+def full_signal(kind: str, node_count: int = 0) -> TreeChangeSet:
     """
     构建不带明细的全量信号。
 
     :param kind: 变更来源
+    :param node_count: 本次全量涉及的节点数，仅用于日志与消费方提示
     :return: ``full=True`` 的变更集
     """
-    return TreeChangeSet(kind=str(kind or "refresh"), full=True)
+    return TreeChangeSet(
+        kind=str(kind or "refresh"),
+        full=True,
+        node_count_hint=int(node_count or 0),
+    )
 
 
 def build_payload(

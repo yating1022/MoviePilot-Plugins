@@ -152,7 +152,7 @@ class GDriveStrm(_PluginBase):
         "读取 Google Drive 目录树，把视频文件映射为本地 STRM；"
         "支持目录树事件增量、定时同步与全量同步。"
     )
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivestrm_"
@@ -460,22 +460,44 @@ class GDriveStrm(_PluginBase):
         """调度器入口：只入队，立即返回。"""
         if not self._enabled:
             return
+        logger.debug("【GDriveStrm】定时同步入队")
         self._enqueue({"kind": "diff", "source": "scheduler"})
 
     @eventmanager.register(EventType.PluginTriggered)
     def on_plugin_triggered(self, event: Event) -> None:
         """处理目录树插件发来的定向变更事件。"""
         if not self._enabled or not self._event_watch:
+            logger.debug("【GDriveStrm】插件未启用或未开启事件处理，忽略事件")
             return
         data = getattr(event, "event_data", event)
         publisher = str(_read_field(data, "plugin_id") or "").strip()
+        event_name = str(_read_field(data, "event_name") or "").strip()
         if publisher.casefold() != self._tree_plugin_id.casefold():
+            logger.debug(
+                f"【GDriveStrm】忽略事件：发布方 {publisher or '-'} "
+                f"不是目录树插件 {self._tree_plugin_id}"
+            )
             return
-        if str(_read_field(data, "event_name") or "").strip() != EVENT_NAME:
+        if event_name != EVENT_NAME:
+            logger.debug(
+                f"【GDriveStrm】忽略事件：事件名 {event_name or '-'} "
+                f"不是 {EVENT_NAME}"
+            )
             return
         payload = _read_field(data, "data")
         if not isinstance(payload, dict):
             payload = {}
+        added = payload.get("added")
+        updated = payload.get("updated")
+        removed = payload.get("removed")
+        logger.info(
+            f"【GDriveStrm】收到目录树事件：来源={publisher}，"
+            f"kind={payload.get('kind') or '-'}，"
+            f"full={bool(payload.get('full'))}，"
+            f"新增={len(added) if isinstance(added, list) else 0}，"
+            f"更新={len(updated) if isinstance(updated, list) else 0}，"
+            f"删除={len(removed) if isinstance(removed, list) else 0}"
+        )
         self._enqueue({"kind": "event", "payload": payload})
 
     def _enqueue(self, job: Dict[str, Any]) -> bool:
@@ -617,6 +639,7 @@ class GDriveStrm(_PluginBase):
                     last_finished_at=now,
                     error="STRM 内容模板缺少 {fileId} 占位符，已中止同步",
                 )
+                logger.warning("【GDriveStrm】STRM 内容模板缺少 {fileId}，同步中止")
                 return
             root = self._resolve_output_dir(self._output_dir)
             if root is None:
@@ -627,6 +650,7 @@ class GDriveStrm(_PluginBase):
                     last_finished_at=now,
                     error="输出目录无效或不可写，请检查配置",
                 )
+                logger.warning(f"【GDriveStrm】输出目录无效或不可写：{self._output_dir}")
                 return
             cleanup = self._cleanup
             root_changed = bool(
@@ -654,6 +678,10 @@ class GDriveStrm(_PluginBase):
                 error="",
             )
             kind = str(job.get("kind") or "diff")
+            logger.info(
+                f"【GDriveStrm】开始同步：类型={kind}，"
+                f"树={self._tree_plugin_id}，输出={root}"
+            )
             database = self.get_database(self._tree_plugin_id)
             records = self._load_records()
             syncer = StrmSyncer(
@@ -686,6 +714,7 @@ class GDriveStrm(_PluginBase):
                 target_count = len(records)
             if outcome is None:
                 return
+            self._log_outcome(outcome)
             try:
                 record_count = self._persist(outcome)
             except SQLAlchemyError:
@@ -755,6 +784,39 @@ class GDriveStrm(_PluginBase):
             f"删除 {len(outcome.removed)}，跳过 {outcome.skipped}，"
             f"错误 {len(outcome.errors)}，耗时 {duration:.1f}s"
         )
+
+    @staticmethod
+    def _log_outcome(outcome: SyncOutcome) -> None:
+        """逐条输出本次同步的新增/更新/删除与错误（有数量上限）。"""
+        limit = 100
+        for item in outcome.added[:limit]:
+            logger.info(
+                f"【GDriveStrm】新增 STRM：{item.rel_path} ← {item.source_path}"
+            )
+        if len(outcome.added) > limit:
+            logger.info(
+                f"【GDriveStrm】新增 STRM 另有 {len(outcome.added) - limit} 条"
+            )
+        for item in outcome.updated[:limit]:
+            logger.info(
+                f"【GDriveStrm】更新 STRM：{item.rel_path} ← {item.source_path}"
+            )
+        if len(outcome.updated) > limit:
+            logger.info(
+                f"【GDriveStrm】更新 STRM 另有 {len(outcome.updated) - limit} 条"
+            )
+        for relative in outcome.removed[:limit]:
+            logger.info(f"【GDriveStrm】删除 STRM：{relative}")
+        if len(outcome.removed) > limit:
+            logger.info(
+                f"【GDriveStrm】删除 STRM 另有 {len(outcome.removed) - limit} 条"
+            )
+        for error in outcome.errors[:20]:
+            logger.warning(f"【GDriveStrm】同步错误：{error}")
+        if len(outcome.errors) > 20:
+            logger.warning(
+                f"【GDriveStrm】同步错误另有 {len(outcome.errors) - 20} 条"
+            )
 
     def _resolve_output_dir(self, value: Any) -> Optional[Path]:
         """解析输出目录并验证可写。"""
@@ -988,6 +1050,7 @@ class GDriveStrm(_PluginBase):
         if not self._enabled:
             return {"success": False, "message": "插件未启用", "data": None}
         self._enqueue({"kind": "diff", "source": "api"})
+        logger.info("【GDriveStrm】手动增量同步已入队")
         return {"success": True, "message": "增量同步已入队", "data": {"queued": True}}
 
     def api_sync_full(self) -> Dict[str, Any]:
@@ -995,6 +1058,7 @@ class GDriveStrm(_PluginBase):
         if not self._enabled:
             return {"success": False, "message": "插件未启用", "data": None}
         self._enqueue({"kind": "full", "source": "api"})
+        logger.info("【GDriveStrm】手动全量同步已入队")
         return {"success": True, "message": "全量同步已入队", "data": {"queued": True}}
 
     def api_status(self) -> Dict[str, Any]:
