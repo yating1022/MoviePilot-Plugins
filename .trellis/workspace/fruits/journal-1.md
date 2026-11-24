@@ -114,3 +114,36 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 收尾：修正根 README 版本并合入 main
+
+**Date**: 2026-11-24
+**Task**: 收尾：修正根 README 版本并合入 main
+**Branch**: `main`
+
+### Summary
+
+补正根 README 中 GDriveStorage 版本至 1.1.4 与配置同步说明；将全部改动 fast-forward 合入 main 并推送，删除误建的 feat/gdrive-config-sync 远程与本地分支。插件测试 69 通过。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3129a68` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
