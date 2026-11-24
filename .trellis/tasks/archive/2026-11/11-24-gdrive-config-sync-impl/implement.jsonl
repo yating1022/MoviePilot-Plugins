@@ -1,0 +1,7 @@
+{"file": ".trellis/tasks/11-24-gdrive-config-sync/design.md", "reason": "请求契约、配置模型与集成设计（唯一事实源）"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync-impl/prd.md", "reason": "实现需求与验收标准"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync-impl/design.md", "reason": "代码级设计与方法签名"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync/research/gdrive-storage-sync-code-map.md", "reason": "集成点、调度/HTTP/测试模式与发布位置"}
+{"file": ".trellis/spec/plugin-v3/index.md", "reason": "V3 插件规范入口"}
+{"file": ".trellis/spec/plugin-v3/page-api-envelope.md", "reason": "页面按钮 API 三键 envelope、VAlert 布局、版本同步"}
+{"file": ".trellis/spec/plugin-v3/plugin-database-and-config-sharing.md", "reason": "插件自有数据 save_data/get_data 与配置模式"}
