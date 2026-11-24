@@ -59,6 +59,11 @@
 | 删除方式 | 移入回收站 | `trash` 或 `permanent` |
 | 上传分片大小（MB） | `8` | 自动对齐到 256 KiB 的倍数 |
 | HTTP 超时（秒） | `60` | 单次请求超时 |
+| 启用定时同步 | 关闭 | 定时把 OAuth 凭据推送到接收端；关闭后仍可手动触发 |
+| 同步接收端 URL | 空 | 完整的 `http(s)://` 地址；非法 URL 不会注册定时任务 |
+| 同步授权 token | 空 | 接收端据此校验来源的自定义 token，密码型输入 |
+| 定时间隔（小时） | `6` | 1–168 |
+| 同步超时（秒） | `30` | 5–300 |
 
 保存后如果勾选“启用插件”，插件会注册 `gdrive` 存储；如果已存在同名类型则只更新配置，不会重复添加。
 
@@ -90,6 +95,58 @@
 - “测试连接”只验证凭据、根目录可读和容量查询。
 - “测试上传”会先在该目录用 `files.create` 创建一个零字节元数据探针并删除，用于验证父目录写权限；随后再写入 `.gdrive_write_test` 验证上传链路。
 - 如果整理上传失败，详情页顶部会显示最近一次上传失败的原因；完整错误在操作日志的“详情”列。
+
+## 配置同步
+
+插件可以把已保存的 Google OAuth 凭据单向推送到一个你控制的接收端，便于其它服务复用同一授权。
+
+### 配置项
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| 启用定时同步 | 关闭 | 开启后按间隔自动推送；关闭后仍可在详情页手动触发 |
+| 同步接收端 URL | 空 | 接收端完整地址，必须为 `http://` 或 `https://` 且带主机名 |
+| 同步授权 token | 空 | 自定义共享密钥，接收端据此校验来源 |
+| 定时间隔（小时） | `6` | 允许 1–168，超出范围自动收敛 |
+| 同步超时（秒） | `30` | 允许 5–300，单次请求总超时 |
+
+只有 `client_id`、`client_secret`、`refresh_token`、接收端 URL、授权 token 都存在且 URL 合法时才会注册定时任务。
+
+### 触发方式
+
+- **定时**：插件启用、开启“启用定时同步”且配置完整时，注册 `GDriveStorageSync` 间隔服务；每次推送在后台线程执行，不阻塞宿主调度线程，同一时刻只允许一个推送。
+- **手动**：详情页“立即同步配置”按钮同步执行一次推送，完成后刷新页面；失败时弹出可读原因。
+
+### 请求契约
+
+```http
+POST {同步接收端 URL}
+Content-Type: application/json
+User-Agent: MoviePilot-GDriveStorage/<插件版本>
+```
+
+请求体恰好四个字段：
+
+```json
+{
+  "client_id": "xxx.apps.googleusercontent.com",
+  "client_secret": "GOCSPX-xxx",
+  "refresh_token": "1//xxx",
+  "token": "用户自定义的同步授权 token"
+}
+```
+
+- 不跟随重定向，`3xx` 视为失败，避免凭据被转发。
+- 任意 `2xx` 视为成功，接收端无需返回特定 JSON。
+- `3xx`/`4xx`/`5xx`、连接错误、超时均视为失败；插件记录状态码（网络错误为空）、响应片段（最多 200 字符）和耗时，等下一次触发，不做自动重试。
+- 接收端接口细节见仓库根目录 `docs/gdrive-config-sync-api.md`。
+
+### 安全提示
+
+- 推送会把 `client_secret` 与 `refresh_token` 发送到接收端，请只填写可信接口。
+- 必须使用 HTTPS；插件允许 `http://` 但会在配置页和详情页提示凭据明文传输。
+- 插件日志和详情页不会输出 `client_secret`、`refresh_token`、`sync_token` 的明文。
+- 接收端应使用常量时间比较校验 `token`，按 `client_id` 做幂等 upsert，且不要记录请求体中的凭据。
 
 ## 系统存储与目录配置
 
@@ -181,7 +238,7 @@
 ## 开发验证
 
 ```bash
-python -m py_compile plugins.v3/gdrivestorage/__init__.py plugins.v3/gdrivestorage/gdrive_client.py
+python -m py_compile plugins.v3/gdrivestorage/__init__.py plugins.v3/gdrivestorage/gdrive_client.py plugins.v3/gdrivestorage/sync_client.py
 python -m pytest tests/v3/gdrivestorage -q
 python -c "import json; json.load(open('package.v3.json', encoding='utf-8'))"
 ```

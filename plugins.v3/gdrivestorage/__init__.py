@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from fastapi import Body
 
@@ -38,6 +39,12 @@ from .gdrive_client import (
     GoogleDriveNotFound,
     format_size,
 )
+from .sync_client import (
+    GDriveConfigSyncClient,
+    SyncResult,
+    build_payload,
+    validate_sync_url,
+)
 
 STORAGE_TYPE = "gdrive"
 DEFAULT_DISPLAY_NAME = "Google Drive"
@@ -45,6 +52,8 @@ DEFAULT_ROOT_PATH = "/"
 DEFAULT_DELETE_MODE = "trash"
 DEFAULT_CHUNK_SIZE_MB = 8
 DEFAULT_TIMEOUT = 60
+DEFAULT_SYNC_INTERVAL_HOURS = 6
+DEFAULT_SYNC_TIMEOUT = 30
 MAX_LOGS = 100
 OAUTH_STATE_TTL = 600
 
@@ -66,6 +75,11 @@ FORM_KEYS = (
     "delete_mode",
     "chunk_size_mb",
     "timeout",
+    "sync_enabled",
+    "sync_url",
+    "sync_token",
+    "sync_interval_hours",
+    "sync_timeout",
 )
 
 
@@ -482,7 +496,7 @@ class GDriveStorage(_PluginBase):
 
     plugin_name = "Google Drive 存储"
     plugin_desc = "把 Google Drive 接入 MoviePilot 存储体系，支持浏览、上传、下载、移动、复制、删除和容量查询。"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivestorage_"
@@ -500,17 +514,28 @@ class GDriveStorage(_PluginBase):
     _logs: List[Dict[str, Any]] = []
     _last_quota: Dict[str, Any] = {}
     _client_lock: threading.RLock
+    _sync_enabled = False
+    _sync_url = ""
+    _sync_token = ""
+    _sync_interval_hours = DEFAULT_SYNC_INTERVAL_HOURS
+    _sync_timeout = DEFAULT_SYNC_TIMEOUT
+    _sync_status: Dict[str, Any] = {}
+    _sync_client: Optional[GDriveConfigSyncClient] = None
+    _sync_lock: threading.Lock
 
     def __init__(self) -> None:
         """初始化线程锁和运行时状态。"""
         super().__init__()
         self._client_lock = threading.RLock()
         self._trace_lock = threading.Lock()
+        self._sync_lock = threading.Lock()
         self._config = {}
         self._logs = []
         self._last_quota = {}
         self._client = None
         self._provider = None
+        self._sync_status = {}
+        self._sync_client = None
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -532,6 +557,19 @@ class GDriveStorage(_PluginBase):
         self._logs = list(stored_logs)[-MAX_LOGS:] if isinstance(stored_logs, list) else []
         stored_quota = self.get_data("quota")
         self._last_quota = stored_quota if isinstance(stored_quota, dict) else {}
+        self._sync_enabled = bool(cfg.get("sync_enabled"))
+        self._sync_url = cfg["sync_url"]
+        self._sync_token = cfg["sync_token"]
+        self._sync_interval_hours = cfg["sync_interval_hours"]
+        self._sync_timeout = cfg["sync_timeout"]
+        stored_sync = self.get_data("sync_status")
+        self._sync_status = stored_sync if isinstance(stored_sync, dict) else {}
+        self._sync_client = GDriveConfigSyncClient(
+            version=self.plugin_version,
+            timeout=float(self._sync_timeout),
+        )
+        if self._sync_url.startswith("http://"):
+            logger.warning("【GDrive】配置同步使用 http://，OAuth 凭据将以明文传输")
         self._client = self._build_client(cfg)
         self._provider = (
             GDriveStorageProvider(self._client, self._record_log, self._trace)
@@ -569,6 +607,13 @@ class GDriveStorage(_PluginBase):
                 client.close()
             except Exception:
                 logger.debug("【GDrive】关闭 HTTP 客户端失败", exc_info=True)
+        sync_client = self._sync_client
+        self._sync_client = None
+        if sync_client is not None:
+            try:
+                sync_client.close()
+            except Exception:
+                logger.debug("【GDrive】关闭配置同步客户端失败", exc_info=True)
 
     def _build_client(self, cfg: Dict[str, Any]) -> Optional[GoogleDriveClient]:
         """凭据完整时构建客户端；不发起网络请求。"""
@@ -649,6 +694,15 @@ class GDriveStorage(_PluginBase):
             "delete_mode": delete_mode,
             "chunk_size_mb": _clamp_int(cfg.get("chunk_size_mb"), 1, 1024, DEFAULT_CHUNK_SIZE_MB),
             "timeout": _clamp_int(cfg.get("timeout"), 5, 600, DEFAULT_TIMEOUT),
+            "sync_enabled": bool(cfg.get("sync_enabled")),
+            "sync_url": str(cfg.get("sync_url") or "").strip(),
+            "sync_token": str(cfg.get("sync_token") or "").strip(),
+            "sync_interval_hours": _clamp_int(
+                cfg.get("sync_interval_hours"), 1, 168, DEFAULT_SYNC_INTERVAL_HOURS,
+            ),
+            "sync_timeout": _clamp_int(
+                cfg.get("sync_timeout"), 5, 300, DEFAULT_SYNC_TIMEOUT,
+            ),
         }
 
     def _save_config(self, updates: Dict[str, Any]) -> None:
@@ -660,6 +714,180 @@ class GDriveStorage(_PluginBase):
             self.update_config(self._config)
         except Exception:
             logger.exception("【GDrive】保存插件配置失败")
+
+    # ------------------------------------------------------------------
+    # 配置同步
+    # ------------------------------------------------------------------
+    def _sync_missing(self, require_enabled: bool = False) -> List[str]:
+        """返回同步前置条件中缺失项的中文描述列表。"""
+        missing: List[str] = []
+        if require_enabled and not self._enabled:
+            missing.append("插件未启用")
+        if require_enabled and not self._sync_enabled:
+            missing.append("未开启定时同步")
+        cfg = self._config or {}
+        if not str(cfg.get("client_id") or "").strip():
+            missing.append("client_id")
+        if not str(cfg.get("client_secret") or "").strip():
+            missing.append("client_secret")
+        if not str(cfg.get("refresh_token") or "").strip():
+            missing.append("refresh_token")
+        if not str(self._sync_url or "").strip():
+            missing.append("同步接口 URL")
+        elif not validate_sync_url(self._sync_url)[0]:
+            missing.append("同步接口 URL 无效")
+        if not str(self._sync_token or "").strip():
+            missing.append("同步 token")
+        return missing
+
+    def _sync_ready(self, require_enabled: bool = False) -> bool:
+        """判断同步所需配置是否完整。"""
+        return not self._sync_missing(require_enabled)
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """返回定时配置同步服务；条件不满足时不注册。"""
+        if not self._enabled or not self._sync_ready(require_enabled=True):
+            return []
+        return [{
+            "id": "GDriveStorageSync",
+            "name": "Google Drive 存储（配置同步）",
+            "trigger": "interval",
+            "func": self.sync_from_scheduler,
+            "kwargs": {"seconds": max(1, int(self._sync_interval_hours)) * 3600},
+        }]
+
+    def sync_from_scheduler(self) -> None:
+        """定时触发：非阻塞拿锁后启动后台线程并立即返回。"""
+        if not self._enabled or not self._sync_ready(require_enabled=True):
+            return
+        if not self._sync_lock.acquire(blocking=False):
+            logger.info("【GDrive】配置同步跳过：已有同步任务在运行")
+            return
+        try:
+            threading.Thread(
+                target=self._sync_worker, args=("scheduler",), daemon=True,
+            ).start()
+        except Exception:
+            # 线程未能启动时不会执行 _sync_worker，必须在此释放锁，避免永久阻塞后续同步
+            self._sync_lock.release()
+            logger.warning("【GDrive】配置同步线程启动失败", exc_info=True)
+
+    def _sync_worker(self, trigger: str) -> None:
+        """后台执行一次推送，并在结束时释放锁。"""
+        try:
+            self._perform_sync(trigger)
+        except Exception:
+            logger.warning("【GDrive】配置同步线程异常", exc_info=True)
+        finally:
+            self._sync_lock.release()
+
+    def _perform_sync(self, trigger: str) -> SyncResult:
+        """执行一次推送、持久化状态并记录日志（不含凭据）。"""
+        cfg = self._config or {}
+        payload = build_payload(
+            cfg.get("client_id"),
+            cfg.get("client_secret"),
+            cfg.get("refresh_token"),
+            cfg.get("sync_token") or self._sync_token,
+        )
+        client = self._sync_client
+        if client is None:
+            result = SyncResult(
+                ok=False,
+                status_code=None,
+                message="同步客户端未初始化",
+                elapsed_ms=0,
+                trigger=trigger,
+                at=_now_text(),
+            )
+        else:
+            result = client.push(self._sync_url, payload, trigger=trigger)
+        self._sync_status = result.to_dict()
+        try:
+            self.save_data("sync_status", self._sync_status)
+        except Exception:
+            logger.debug("【GDrive】保存同步状态失败", exc_info=True)
+        if result.ok:
+            logger.info(
+                f"【GDrive】配置同步成功：trigger={trigger} "
+                f"status={result.status_code} {result.elapsed_ms}ms"
+            )
+        else:
+            logger.warning(
+                f"【GDrive】配置同步失败：trigger={trigger} "
+                f"status={result.status_code} {result.message}"
+            )
+        return result
+
+    def _sync_display_url(self) -> str:
+        """只展示接收端主机与路径，避免回显任何敏感信息。"""
+        try:
+            parsed = urlparse(self._sync_url or "")
+        except ValueError:
+            return "(URL 无效)"
+        if not parsed.scheme or not parsed.netloc:
+            return "(URL 无效)"
+        return f"{parsed.netloc}{parsed.path or ''}"
+
+    def _sync_alert(self) -> dict:
+        """构造详情页的配置同步状态告警。"""
+        if not self._sync_url or not self._sync_token:
+            return self._alert(
+                "info",
+                "未启用配置同步（在配置页填写接收端 URL 与 token）。",
+            )
+        status = self._sync_status if isinstance(self._sync_status, dict) else {}
+        parts = [
+            f"配置同步：定时{'开' if self._sync_enabled else '关'}",
+            f"接收端 {self._sync_display_url()}",
+            f"间隔 {self._sync_interval_hours} 小时",
+        ]
+        if status:
+            state = "成功" if status.get("ok") else "失败"
+            code = status.get("status_code")
+            parts.append(
+                f"上次 {status.get('at') or '-'} {state} "
+                f"状态码 {code if code is not None else '-'} "
+                f"耗时 {status.get('elapsed_ms') or 0}ms"
+            )
+            if not status.get("ok") and status.get("message"):
+                parts.append(f"错误：{status.get('message')}")
+        else:
+            parts.append("尚无同步记录")
+        text = "；".join(parts) + "。"
+        if self._sync_url.startswith("http://"):
+            text += "注意：当前使用 http://，凭据明文传输。"
+        if status and not status.get("ok"):
+            return self._alert("error", text)
+        if self._sync_url.startswith("http://"):
+            return self._alert("warning", text)
+        return self._alert("info", text)
+
+    def api_sync_push(self) -> Dict[str, Any]:
+        """立即推送一次配置；同步执行并返回三键 envelope。"""
+        if not self._enabled:
+            return {"success": False, "message": "插件未启用", "data": None}
+        missing = self._sync_missing(require_enabled=False)
+        if missing:
+            return {
+                "success": False,
+                "message": "同步配置不完整：" + "、".join(missing),
+                "data": None,
+            }
+        if not self._sync_lock.acquire(blocking=False):
+            return {"success": False, "message": "同步进行中，请稍后再试", "data": None}
+        try:
+            result = self._perform_sync("manual")
+        except Exception as err:
+            logger.warning(f"【GDrive】手动配置同步异常：{type(err).__name__}")
+            return {"success": False, "message": f"同步失败：{err}", "data": None}
+        finally:
+            self._sync_lock.release()
+        return {
+            "success": result.ok,
+            "message": "同步成功" if result.ok else f"同步失败：{result.message}",
+            "data": result.to_dict(),
+        }
 
     # ------------------------------------------------------------------
     # 系统存储注册
@@ -1194,6 +1422,13 @@ class GDriveStorage(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "清空操作日志",
+            },
+            {
+                "path": "/sync/push",
+                "endpoint": self.api_sync_push,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即向配置的接口推送 Google OAuth 凭据",
             },
         ]
 
@@ -1745,6 +1980,90 @@ class GDriveStorage(_PluginBase):
                             },
                         ],
                     },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "class": "mb-3",
+                            "text": (
+                                "配置同步会把 client_secret 与 refresh_token 发送到下方接口，"
+                                "请只填写可信的接收端，并优先使用 https://。"
+                            ),
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {"model": "sync_enabled", "label": "启用定时同步"},
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "sync_url",
+                                        "label": "同步接收端 URL",
+                                        "placeholder": "https://example.com/api/gdrive/config",
+                                    },
+                                }],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "sync_token",
+                                        "label": "同步授权 token",
+                                        "type": "password",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "sync_interval_hours",
+                                        "label": "定时间隔（小时）",
+                                        "type": "number",
+                                        "min": 1,
+                                        "max": 168,
+                                        "step": 1,
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "sync_timeout",
+                                        "label": "同步超时（秒）",
+                                        "type": "number",
+                                        "min": 5,
+                                        "max": 300,
+                                        "step": 5,
+                                    },
+                                }],
+                            },
+                        ],
+                    },
                 ],
             }
         ], {
@@ -1764,6 +2083,11 @@ class GDriveStorage(_PluginBase):
             "delete_mode": DEFAULT_DELETE_MODE,
             "chunk_size_mb": DEFAULT_CHUNK_SIZE_MB,
             "timeout": DEFAULT_TIMEOUT,
+            "sync_enabled": False,
+            "sync_url": "",
+            "sync_token": "",
+            "sync_interval_hours": DEFAULT_SYNC_INTERVAL_HOURS,
+            "sync_timeout": DEFAULT_SYNC_TIMEOUT,
         }
 
     def get_page(self) -> Optional[List[dict]]:
@@ -1817,11 +2141,13 @@ class GDriveStorage(_PluginBase):
                 f"{latest_upload_failure.get('path') or '-'}；"
                 f"原因：{latest_upload_failure.get('detail') or '未知'}",
             ))
+        contents.append(self._sync_alert())
 
         buttons: List[dict] = [
             self._page_button("测试连接", "mdi-connection", "/test"),
             self._page_button("测试上传", "mdi-cloud-upload", "/test_upload"),
             self._page_button("刷新容量", "mdi-cloud-refresh", "/quota"),
+            self._page_button("立即同步配置", "mdi-sync", "/sync/push"),
         ]
         auth_url = self._auth_url()
         if auth_url:

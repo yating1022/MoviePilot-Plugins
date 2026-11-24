@@ -83,6 +83,11 @@ REQUIRED_FORM_KEYS = {
     "delete_mode",
     "chunk_size_mb",
     "timeout",
+    "sync_enabled",
+    "sync_url",
+    "sync_token",
+    "sync_interval_hours",
+    "sync_timeout",
 }
 
 ENVELOPE_KEYS = {"success", "message", "data"}
@@ -186,6 +191,44 @@ def test_page_api_returns_exactly_three_keys() -> None:
             assert _dict_keys(node) == ENVELOPE_KEYS, (
                 f"{endpoint} envelope keys must be {ENVELOPE_KEYS}, got {_dict_keys(node)}"
             )
+
+
+def test_get_api_declares_sync_push_endpoint() -> None:
+    """get_api 必须声明 POST /sync/push 并指向 api_sync_push。"""
+    class_node = _class_node(_tree(), "GDriveStorage")
+    get_api = _method_node(class_node, "get_api")
+    list_returns = [
+        node.value for node in ast.walk(get_api)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.List)
+    ]
+    assert list_returns, "get_api must return a list literal"
+    matched: Optional[ast.Dict] = None
+    for element in list_returns[0].elts:
+        assert isinstance(element, ast.Dict)
+        values = {
+            key.value: value
+            for key, value in zip(element.keys, element.values)
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        path = values.get("path")
+        if isinstance(path, ast.Constant) and path.value == "/sync/push":
+            matched = element
+            break
+    assert matched is not None, "get_api must declare /sync/push"
+    values = {
+        key.value: value
+        for key, value in zip(matched.keys, matched.values)
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    endpoint = values["endpoint"]
+    assert isinstance(endpoint, ast.Attribute)
+    assert endpoint.attr == "api_sync_push"
+    methods = values["methods"]
+    assert isinstance(methods, ast.List)
+    assert [item.value for item in methods.elts] == ["POST"]
+    auth = values["auth"]
+    assert isinstance(auth, ast.Constant)
+    assert auth.value == "bear"
 
 
 def test_oauth_callback_is_anonymous() -> None:
@@ -533,9 +576,250 @@ def test_get_form_defaults_match_readme() -> None:
         "delete_mode": "trash",
         "chunk_size_mb": 8,
         "timeout": 60,
+        "sync_enabled": False,
+        "sync_url": "",
+        "sync_token": "",
+        "sync_interval_hours": 6,
+        "sync_timeout": 30,
     }
     assert defaults == expected
     assert defaults["redirect_uri"] in README_PATH.read_text(encoding="utf-8")
+
+
+def _configure_sync_plugin(plugin: Any, **overrides: Any) -> Dict[str, Any]:
+    """把插件实例配置成同步已就绪状态。"""
+    raw: Dict[str, Any] = {
+        "enabled": True,
+        "client_id": "cid",
+        "client_secret": "client-secret-value",
+        "refresh_token": "refresh-token-value",
+        "sync_enabled": True,
+        "sync_url": "https://example.com/api/gdrive/config",
+        "sync_token": "sync-token-value",
+        "sync_interval_hours": 3,
+        "sync_timeout": 15,
+    }
+    raw.update(overrides)
+    plugin._config = plugin._normalize_config(raw)
+    plugin._enabled = bool(raw["enabled"])
+    plugin._sync_enabled = bool(plugin._config["sync_enabled"])
+    plugin._sync_url = plugin._config["sync_url"]
+    plugin._sync_token = plugin._config["sync_token"]
+    plugin._sync_interval_hours = plugin._config["sync_interval_hours"]
+    plugin._sync_timeout = plugin._config["sync_timeout"]
+    plugin._sync_status = {}
+    return plugin._config
+
+
+def test_get_service_registers_sync_only_when_ready_and_enabled() -> None:
+    """只有启用且配置完整时才注册定时同步服务。"""
+    module = _load_plugin_module()
+    plugin = module.GDriveStorage()
+    _configure_sync_plugin(plugin)
+
+    services = plugin.get_service()
+    assert len(services) == 1
+    service = services[0]
+    assert service["id"] == "GDriveStorageSync"
+    assert service["trigger"] == "interval"
+    assert service["kwargs"] == {"seconds": 3 * 3600}
+    assert service["func"] == plugin.sync_from_scheduler
+
+    plugin._sync_enabled = False
+    assert plugin.get_service() == []
+
+    plugin._sync_enabled = True
+    plugin._enabled = False
+    assert plugin.get_service() == []
+
+    plugin._enabled = True
+    plugin._sync_token = ""
+    assert plugin.get_service() == []
+
+    plugin._sync_token = "sync-token-value"
+    plugin._sync_url = "ftp://example.com/hook"
+    assert plugin.get_service() == []
+
+    plugin._sync_url = "https://example.com/hook"
+    assert len(plugin.get_service()) == 1
+
+
+def test_get_service_requires_oauth_credentials() -> None:
+    """缺少 OAuth 凭据时不注册定时同步服务。"""
+    module = _load_plugin_module()
+    for missing_key in ("client_id", "client_secret", "refresh_token"):
+        plugin = module.GDriveStorage()
+        _configure_sync_plugin(plugin, **{missing_key: ""})
+        assert plugin.get_service() == [], missing_key
+
+
+def test_api_sync_push_returns_envelope_and_persists_status() -> None:
+    """手动推送同步执行、持久化状态并返回三键 envelope。"""
+    module = _load_plugin_module()
+    plugin = module.GDriveStorage()
+    _configure_sync_plugin(plugin)
+
+    class FakeSyncClient:
+        def __init__(self) -> None:
+            self.calls: List[tuple] = []
+            self.result = module.SyncResult(
+                True, 200, "HTTP 200 成功", 5, "manual", "2026-11-24 10:00:00",
+            )
+
+        def push(self, url: str, payload: Dict[str, str], trigger: str = "manual") -> Any:
+            self.calls.append((url, dict(payload), trigger))
+            return self.result
+
+    fake = FakeSyncClient()
+    plugin._sync_client = fake
+
+    response = plugin.api_sync_push()
+
+    assert set(response) == ENVELOPE_KEYS
+    assert response["success"] is True
+    assert response["message"] == "同步成功"
+    assert response["data"] == fake.result.to_dict()
+    assert plugin._sync_status == fake.result.to_dict()
+    assert plugin.get_data("sync_status") == fake.result.to_dict()
+    url, payload, trigger = fake.calls[0]
+    assert url == "https://example.com/api/gdrive/config"
+    assert trigger == "manual"
+    assert payload == {
+        "client_id": "cid",
+        "client_secret": "client-secret-value",
+        "refresh_token": "refresh-token-value",
+        "token": "sync-token-value",
+    }
+
+
+def test_api_sync_push_failure_envelopes_are_three_keys() -> None:
+    """未启用、配置缺失、并发占用都返回三键失败 envelope。"""
+    module = _load_plugin_module()
+
+    disabled = module.GDriveStorage()
+    _configure_sync_plugin(disabled)
+    disabled._enabled = False
+    response = disabled.api_sync_push()
+    assert set(response) == ENVELOPE_KEYS
+    assert response == {"success": False, "message": "插件未启用", "data": None}
+
+    missing = module.GDriveStorage()
+    _configure_sync_plugin(missing, sync_token="")
+    response = missing.api_sync_push()
+    assert set(response) == ENVELOPE_KEYS
+    assert response["success"] is False
+    assert "同步配置不完整" in response["message"]
+    assert response["data"] is None
+
+    busy = module.GDriveStorage()
+    _configure_sync_plugin(busy)
+    assert busy._sync_lock.acquire(blocking=False)
+    try:
+        response = busy.api_sync_push()
+    finally:
+        busy._sync_lock.release()
+    assert set(response) == ENVELOPE_KEYS
+    assert response["success"] is False
+    assert "同步进行中" in response["message"]
+    assert response["data"] is None
+
+
+def test_sync_alert_does_not_render_credentials() -> None:
+    """详情页同步状态只显示主机/间隔/结果，不输出凭据明文。"""
+    module = _load_plugin_module()
+    plugin = module.GDriveStorage()
+    _configure_sync_plugin(plugin, sync_url="http://example.com/hook")
+    plugin._sync_status = module.SyncResult(
+        False, 500, "HTTP 500：upstream error", 8, "scheduler", "2026-11-24 10:00:00",
+    ).to_dict()
+
+    alert = plugin._sync_alert()
+    text = alert["props"]["text"]
+    assert alert["props"]["type"] == "error"
+    assert alert["props"]["style"] == "flex: 0 0 auto;"
+    assert "example.com/hook" in text
+    assert "间隔 3 小时" in text
+    assert "上次 2026-11-24 10:00:00 失败 状态码 500 耗时 8ms" in text
+    assert "http://" in text and "明文" in text
+
+    page_text = repr(plugin.get_page())
+    assert "立即同步配置" in page_text
+    for secret in ("client-secret-value", "refresh-token-value", "sync-token-value"):
+        assert secret not in page_text
+
+
+def test_init_plugin_loads_sync_runtime_state() -> None:
+    """init_plugin 读取同步配置与持久化状态，并构造同步客户端。"""
+    module = _load_plugin_module()
+    _reset_stub_storage()
+    plugin = module.GDriveStorage()
+    plugin.save_data("sync_status", {"ok": True, "at": "2026-11-24 09:00:00"})
+
+    plugin.init_plugin({
+        "enabled": True,
+        "sync_enabled": True,
+        "sync_url": "https://example.com/hook",
+        "sync_token": "tok",
+        "sync_interval_hours": 999,
+        "sync_timeout": 1,
+    })
+
+    assert plugin._sync_enabled is True
+    assert plugin._sync_url == "https://example.com/hook"
+    assert plugin._sync_token == "tok"
+    assert plugin._sync_interval_hours == 168
+    assert plugin._sync_timeout == 5
+    assert plugin._sync_status == {"ok": True, "at": "2026-11-24 09:00:00"}
+    assert isinstance(plugin._sync_client, module.GDriveConfigSyncClient)
+    assert plugin._sync_client.user_agent == (
+        f"MoviePilot-GDriveStorage/{module.GDriveStorage.plugin_version}"
+    )
+
+    sync_client = plugin._sync_client
+    plugin.stop_service()
+    assert plugin._sync_client is None
+    plugin.stop_service()
+    assert sync_client is not None
+
+
+def test_sync_worker_releases_lock_when_push_raises() -> None:
+    """后台推送抛异常时也必须释放同步锁。"""
+    module = _load_plugin_module()
+    plugin = module.GDriveStorage()
+    _configure_sync_plugin(plugin)
+
+    def boom(trigger: str) -> Any:
+        raise RuntimeError("boom")
+
+    plugin._perform_sync = boom
+    assert plugin._sync_lock.acquire(blocking=False)
+    plugin._sync_worker("scheduler")
+    assert plugin._sync_lock.locked() is False
+    # 锁必须仍然可用，否则后续同步会被永久跳过
+    assert plugin._sync_lock.acquire(blocking=False)
+    plugin._sync_lock.release()
+
+
+def test_sync_from_scheduler_releases_lock_when_thread_start_fails(monkeypatch) -> None:
+    """线程启动失败时不能永久持有同步锁。"""
+    module = _load_plugin_module()
+    plugin = module.GDriveStorage()
+    _configure_sync_plugin(plugin)
+
+    class _BrokenThread:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(
+        module, "threading", types.SimpleNamespace(Thread=_BrokenThread),
+    )
+    plugin.sync_from_scheduler()
+    assert plugin._sync_lock.locked() is False
+    assert plugin._sync_lock.acquire(blocking=False)
+    plugin._sync_lock.release()
 
 
 def test_get_page_does_not_raise_in_all_states() -> None:
