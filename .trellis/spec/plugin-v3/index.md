@@ -11,3 +11,4 @@
 | [Custom Storage Backend](./storage-extension.md) | 通过插件注册自定义存储、`StorageOperSelection` 适配器、`get_module` 存储方法与严格查询语义 |
 | [Plugin Database & Config Sharing](./plugin-database-and-config-sharing.md) | 通过 `get_config(plugin_id)` 复用其他插件配置、插件自有表、快照式刷新与后台线程/取消模式 |
 | [Cross-plugin Events](./cross-plugin-events.md) | `EventType.PluginTriggered` 定向事件、载荷上限与 `tree.changed` 契约 |
+| [Outbound Config Sync](./outbound-config-sync.md) | 向用户指定接口主动推送凭据/配置：定时+手动、非阻塞锁、四字段契约、2xx 判定与凭据安全 |
