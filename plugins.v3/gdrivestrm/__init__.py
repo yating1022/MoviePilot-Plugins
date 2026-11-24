@@ -31,6 +31,9 @@ except Exception:  # pragma: no cover - 宿主差异
     _settings = None
 
 from .strm_mapper import (
+    CONTENT_MODE_PATH,
+    DEFAULT_CONTENT_MODE,
+    DEFAULT_PATH_PREFIX,
     DEFAULT_URL_TEMPLATE,
     DEFAULT_VIDEO_EXTENSIONS,
     build_targets,
@@ -152,7 +155,7 @@ class GDriveStrm(_PluginBase):
         "读取 Google Drive 目录树，把视频文件映射为本地 STRM；"
         "支持目录树事件增量、定时同步与全量同步。"
     )
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivestrm_"
@@ -167,6 +170,8 @@ class GDriveStrm(_PluginBase):
         self._tree_plugin_id = DEFAULT_TREE_PLUGIN
         self._output_dir = DEFAULT_OUTPUT_DIR
         self._extensions = parse_extensions(DEFAULT_VIDEO_EXTENSIONS)
+        self._content_mode = DEFAULT_CONTENT_MODE
+        self._path_prefix = DEFAULT_PATH_PREFIX
         self._url_template = DEFAULT_URL_TEMPLATE
         self._event_watch = True
         self._cleanup = True
@@ -191,6 +196,8 @@ class GDriveStrm(_PluginBase):
         self._tree_plugin_id = cfg["tree_plugin_id"]
         self._output_dir = cfg["output_dir"]
         self._extensions = parse_extensions(cfg["extensions"])
+        self._content_mode = cfg["content_mode"]
+        self._path_prefix = cfg["path_prefix"]
         self._url_template = cfg["url_template"]
         self._event_watch = bool(cfg["event_watch"])
         self._cleanup = bool(cfg["cleanup"])
@@ -211,7 +218,13 @@ class GDriveStrm(_PluginBase):
             logger.info(
                 f"【GDriveStrm】插件已启用 v{self.plugin_version}："
                 f"树插件={self._tree_plugin_id}，输出={self._output_dir}，"
-                f"定时同步={self._auto_sync}，清理={self._cleanup}"
+                f"内容模式={self._content_mode}"
+                + (
+                    f"（前缀={self._path_prefix}）"
+                    if self._content_mode == CONTENT_MODE_PATH
+                    else ""
+                )
+                + f"，定时同步={self._auto_sync}，清理={self._cleanup}"
             )
         else:
             self._worker = None
@@ -251,6 +264,15 @@ class GDriveStrm(_PluginBase):
             "extensions": str(
                 cfg.get("extensions") or DEFAULT_VIDEO_EXTENSIONS
             ).strip() or DEFAULT_VIDEO_EXTENSIONS,
+            "content_mode": (
+                CONTENT_MODE_PATH
+                if str(cfg.get("content_mode") or "").strip()
+                == CONTENT_MODE_PATH
+                else DEFAULT_CONTENT_MODE
+            ),
+            "path_prefix": str(
+                cfg.get("path_prefix") or DEFAULT_PATH_PREFIX
+            ).strip(),
             "url_template": str(
                 cfg.get("url_template") or DEFAULT_URL_TEMPLATE
             ).strip() or DEFAULT_URL_TEMPLATE,
@@ -283,7 +305,8 @@ class GDriveStrm(_PluginBase):
                             "class": "mb-3",
                             "text": (
                                 "本插件读取 GDriveTree 的目录树数据，请先启用并刷新目录树；"
-                                "视频文件会生成 .strm，内容为 Google Drive 直链。"
+                                "视频文件会生成 .strm。内容可写 Google Drive 直链，"
+                                "也可写本地挂载路径（需配置路径前缀）。"
                             ),
                         },
                     },
@@ -372,13 +395,53 @@ class GDriveStrm(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VSelect",
+                                    "props": {
+                                        "model": "content_mode",
+                                        "label": "STRM 内容模式",
+                                        "items": [
+                                            {"title": "Google Drive 直链", "value": "url"},
+                                            {"title": "本地文件路径", "value": "path"},
+                                        ],
+                                        "hint": "本地路径模式需要配置下方的路径前缀",
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "path_prefix",
+                                        "label": "本地路径前缀",
+                                        "placeholder": "/home/googleDevice",
+                                        "hint": (
+                                            "仅本地路径模式生效；与目录树根下的相对路径拼接，"
+                                            "例如前缀 /home/googleDevice + A/B/C/a.mkv "
+                                            "→ /home/googleDevice/A/B/C/a.mkv"
+                                        ),
+                                        "persistent-hint": True,
+                                    },
+                                }],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [{
                                     "component": "VTextField",
                                     "props": {
                                         "model": "url_template",
-                                        "label": "STRM 内容模板",
-                                        "hint": "必须包含 {fileId} 占位符",
+                                        "label": "STRM 内容模板（直链模式）",
+                                        "hint": "直链模式必须包含 {fileId} 占位符；本地路径模式忽略此项",
                                         "persistent-hint": True,
                                     },
                                 }],
@@ -433,6 +496,8 @@ class GDriveStrm(_PluginBase):
             "tree_plugin_id": DEFAULT_TREE_PLUGIN,
             "output_dir": DEFAULT_OUTPUT_DIR,
             "extensions": DEFAULT_VIDEO_EXTENSIONS,
+            "content_mode": DEFAULT_CONTENT_MODE,
+            "path_prefix": DEFAULT_PATH_PREFIX,
             "url_template": DEFAULT_URL_TEMPLATE,
             "event_watch": True,
             "cleanup": True,
@@ -631,7 +696,20 @@ class GDriveStrm(_PluginBase):
         target_count = 0
         previous = self._load_meta()
         try:
-            if "{fileId}" not in self._url_template:
+            if self._content_mode == CONTENT_MODE_PATH:
+                if not self._path_prefix:
+                    now = datetime.now()
+                    self._write_meta(
+                        status="failed",
+                        last_started_at=now,
+                        last_finished_at=now,
+                        error="本地路径模式需要配置路径前缀，已中止同步",
+                    )
+                    logger.warning(
+                        "【GDriveStrm】本地路径模式缺少路径前缀，同步中止"
+                    )
+                    return
+            elif "{fileId}" not in self._url_template:
                 now = datetime.now()
                 self._write_meta(
                     status="failed",
@@ -680,7 +758,13 @@ class GDriveStrm(_PluginBase):
             kind = str(job.get("kind") or "diff")
             logger.info(
                 f"【GDriveStrm】开始同步：类型={kind}，"
-                f"树={self._tree_plugin_id}，输出={root}"
+                f"树={self._tree_plugin_id}，输出={root}，"
+                f"内容模式={self._content_mode}"
+                + (
+                    f"（前缀={self._path_prefix}）"
+                    if self._content_mode == CONTENT_MODE_PATH
+                    else ""
+                )
             )
             database = self.get_database(self._tree_plugin_id)
             records = self._load_records()
@@ -694,6 +778,8 @@ class GDriveStrm(_PluginBase):
                     snapshot.root_path,
                     self._extensions,
                     self._url_template,
+                    content_mode=self._content_mode,
+                    path_prefix=self._path_prefix,
                 )
                 target_count = len(targets)
                 outcome = syncer.full_sync(
@@ -710,6 +796,8 @@ class GDriveStrm(_PluginBase):
                     extensions=self._extensions,
                     url_template=self._url_template,
                     records=records,
+                    content_mode=self._content_mode,
+                    path_prefix=self._path_prefix,
                 )
                 target_count = len(records)
             if outcome is None:
@@ -1074,6 +1162,8 @@ class GDriveStrm(_PluginBase):
                 "tree_available": available,
                 "tree_detail": detail,
                 "output_dir": meta.get("output_dir") or self._output_dir,
+                "content_mode": self._content_mode,
+                "path_prefix": self._path_prefix,
                 "status": meta.get("status") or "idle",
                 "last_started_at": _format_datetime(meta.get("last_started_at")),
                 "last_finished_at": _format_datetime(meta.get("last_finished_at")),
@@ -1204,8 +1294,15 @@ class GDriveStrm(_PluginBase):
             "failed": "失败",
             "cancelled": "已中止",
         }.get(status, status)
+        mode_text = (
+            f"本地路径（{self._path_prefix}）"
+            if self._content_mode == CONTENT_MODE_PATH
+            else "Google 直链"
+        )
         stats_text = (
-            f"状态：{status_text}；输出目录：{meta.get('output_dir') or self._output_dir}；"
+            f"状态：{status_text}；"
+            f"内容模式：{mode_text}；"
+            f"输出目录：{meta.get('output_dir') or self._output_dir}；"
             f"最后成功：{_format_datetime(meta.get('last_success_at'))}；"
             f"目标 {int(meta.get('target_count') or 0)}，"
             f"记录 {int(meta.get('record_count') or 0)}，"

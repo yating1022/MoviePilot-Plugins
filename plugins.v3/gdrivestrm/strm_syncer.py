@@ -14,6 +14,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional
 
 from .strm_mapper import (
+    DEFAULT_CONTENT_MODE,
+    DEFAULT_PATH_PREFIX,
     StrmTarget,
     TreeFile,
     build_target,
@@ -112,6 +114,8 @@ class StrmSyncer:
         extensions: FrozenSet[str],
         url_template: str,
         records: Dict[str, StrmRecordData],
+        content_mode: str = DEFAULT_CONTENT_MODE,
+        path_prefix: str = DEFAULT_PATH_PREFIX,
     ) -> SyncOutcome:
         """
         只处理事件携带的变更节点，不扫描整棵树。
@@ -121,8 +125,10 @@ class StrmSyncer:
         :param removed: 删除节点载荷
         :param root_path: 目录树根路径
         :param extensions: 视频后缀集合
-        :param url_template: URL 模板
+        :param url_template: URL 模式下的内容模板
         :param records: 已有记录，方法内会同步更新
+        :param content_mode: ``url`` 写直链；``path`` 写本地路径
+        :param path_prefix: 路径模式下的本地挂载前缀
         :return: 同步结果
         """
         outcome = SyncOutcome()
@@ -147,6 +153,8 @@ class StrmSyncer:
                 by_file,
                 by_path,
                 outcome,
+                content_mode=content_mode,
+                path_prefix=path_prefix,
             )
 
         for node in updated:
@@ -170,6 +178,8 @@ class StrmSyncer:
                 by_file,
                 by_path,
                 outcome,
+                content_mode=content_mode,
+                path_prefix=path_prefix,
             )
 
         for node in removed:
@@ -190,11 +200,19 @@ class StrmSyncer:
         by_file: Dict[str, List[str]],
         by_path: Dict[str, List[str]],
         outcome: SyncOutcome,
+        *,
+        content_mode: str = DEFAULT_CONTENT_MODE,
+        path_prefix: str = DEFAULT_PATH_PREFIX,
     ) -> None:
         """把单个新增/更新节点写入磁盘并维护索引。"""
         path = str(node.get("path") or "")
         target = build_target(
-            _tree_file(node), root_path, extensions, url_template
+            _tree_file(node),
+            root_path,
+            extensions,
+            url_template,
+            content_mode=content_mode,
+            path_prefix=path_prefix,
         )
         if target is None:
             outcome.errors.append(f"{path}: 无法映射为 STRM 目标")

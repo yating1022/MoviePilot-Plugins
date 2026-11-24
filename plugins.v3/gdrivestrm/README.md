@@ -7,9 +7,13 @@
 
 - **结构一致**：树中 `/A/B/C/D/a.mkv` 映射为 `<输出根>/A/B/C/D/a.strm`；
   只创建命中视频文件的目录链。
-- **直链内容**：`.strm` 内写入
-  `https://www.googleapis.com/drive/v3/files/{fileId}?alt=media&supportsAllDrives=true`；
-  文件快捷方式优先使用目标文件 ID。
+- **内容可配置**：`.strm` 内容支持两种模式：
+  - **Google Drive 直链**（默认）：写入
+    `https://www.googleapis.com/drive/v3/files/{fileId}?alt=media&supportsAllDrives=true`；
+    文件快捷方式优先使用目标文件 ID。
+  - **本地文件路径**：写入「路径前缀 + 目录树根下的相对路径」，
+    例如树中 `/A/B/C/a.mkv`、前缀 `/home/googleDevice`，内容为
+    `/home/googleDevice/A/B/C/a.mkv`，适合配合 rclone/CloudDrive 等挂载使用。
 - **后缀白名单**：默认覆盖常见视频格式（mkv/mp4/avi/ts/m2ts/iso/rmvb…），可自定义。
 - **事件增量**：GDriveTree 开启「通知 STRM 插件」后，树变化会定向发送
   `tree.changed` 事件，本插件合并后秒级写入。
@@ -33,7 +37,9 @@
 | 目录树插件 ID | `GDriveTree` | 使用插件分身时填分身 ID |
 | STRM 输出根目录 | `/config/strm` | 绝对路径；相对路径按宿主配置目录解析 |
 | 视频后缀 | 常见视频格式 | 逗号/空格/换行分隔；留空恢复默认 |
-| STRM 内容模板 | Google Drive 直链 | 必须包含 `{fileId}` |
+| STRM 内容模式 | Google Drive 直链 | `Google Drive 直链` 或 `本地文件路径` |
+| 本地路径前缀 | 空 | 仅本地路径模式生效；例 `/home/googleDevice` |
+| STRM 内容模板 | Google Drive 直链 | 直链模式必须包含 `{fileId}`；路径模式忽略 |
 | 处理目录树事件 | 开 | 是否响应 `tree.changed` |
 | 清理失效 STRM | 开 | 删除源已消失的已记录文件 |
 | 定时同步 | 关 | 注册 interval 定时任务 |
@@ -99,6 +105,8 @@
 | 输出目录无效或不可写 | 检查路径是否为绝对路径、容器内是否有写权限 |
 | 路径中没有出现预期的层级 | 检查 GDriveTree 的 `root_path`；相对路径已去掉该前缀 |
 | Emby/Jellyfin 无法播放 | 直链需要 Google OAuth；请配合可携带授权的代理或网关使用 |
+| 本地路径模式无法播放 | 前缀必须是**媒体服务器容器内**实际挂载点；内容为「前缀 + 相对目录树根的路径」，不含 `root_path` 这一层 |
+| 路径模式同步失败，提示配置前缀 | 本地路径模式必须填写非空的「本地路径前缀」 |
 | 删除/改名后旧 STRM 仍在 | 确认「清理失效 STRM」已开启；或执行一次全量同步 |
 | 切换输出目录后旧目录文件还在 | 切换时插件会重置记录并跳过首次清理，旧目录文件需手动处理 |
 | 多个实例共用同一输出目录 | 不要同时开启清理，或为每个实例使用不同输出目录 |
@@ -107,6 +115,7 @@
 ## 说明
 
 - 本插件只读 GDriveTree 的数据，不访问 Google Drive 接口、不修改云端文件。
+- 本地路径模式只做字符串拼接，不校验媒体服务器上的挂载路径是否存在。
 - 不做转码、不生成 nfo/封面/字幕，不代理视频流。
 - 首版为单目录树、单输出根目录。
 - Google Drive 允许同目录同名文件；同一路径只会生成一个 STRM（按路径与文件 ID

@@ -117,3 +117,101 @@ def test_build_targets_deduplicates_by_rel_path() -> None:
     )
     assert list(targets) == ["A/B/C/D/a.strm"]
     assert targets["A/B/C/D/a.strm"].source_file_id == "two"
+
+
+def test_join_path_prefix_normalizes() -> None:
+    """路径前缀统一分隔符、去尾斜杠，并处理根目录与空值。"""
+    assert (
+        mapper.join_path_prefix("/home/googleDevice", "A/B/C/a.mkv")
+        == "/home/googleDevice/A/B/C/a.mkv"
+    )
+    assert (
+        mapper.join_path_prefix("/home/googleDevice/", "A/B/C/a.mkv")
+        == "/home/googleDevice/A/B/C/a.mkv"
+    )
+    assert (
+        mapper.join_path_prefix("\\home\\googleDevice\\", "A/B/C/a.mkv")
+        == "/home/googleDevice/A/B/C/a.mkv"
+    )
+    assert (
+        mapper.join_path_prefix("//home//googleDevice//", "A/B/C/a.mkv")
+        == "/home/googleDevice/A/B/C/a.mkv"
+    )
+    assert mapper.join_path_prefix("/", "A/B/C/a.mkv") == "/A/B/C/a.mkv"
+    assert mapper.join_path_prefix("", "A/B/C/a.mkv") == "/A/B/C/a.mkv"
+    assert (
+        mapper.join_path_prefix("D:/Media", "A/B/C/a.mkv")
+        == "D:/Media/A/B/C/a.mkv"
+    )
+
+
+def test_build_target_path_mode_maps_example() -> None:
+    """路径模式：前缀 + 相对树路径，忽略 URL 模板和文件 ID。"""
+    target = mapper.build_target(
+        _file(),
+        "/",
+        EXTENSIONS,
+        "",
+        content_mode=mapper.CONTENT_MODE_PATH,
+        path_prefix="/home/googleDevice",
+    )
+    assert target is not None
+    assert target.rel_path == "A/B/C/D/a.strm"
+    assert target.url == "/home/googleDevice/A/B/C/D/a.mkv"
+
+
+def test_build_target_path_mode_strips_root_prefix() -> None:
+    """路径模式同样去掉目录树根路径，不包含虚拟根这一层。"""
+    target = mapper.build_target(
+        _file(path="/GDrive/Movies/a.mkv"),
+        "/GDrive/",
+        EXTENSIONS,
+        "",
+        content_mode=mapper.CONTENT_MODE_PATH,
+        path_prefix="/home/googleDevice",
+    )
+    assert target is not None
+    assert target.rel_path == "Movies/a.strm"
+    assert target.url == "/home/googleDevice/Movies/a.mkv"
+
+
+def test_build_target_path_mode_ignores_shortcut_target() -> None:
+    """路径模式使用快捷方式节点自身路径，不使用目标文件 ID。"""
+    target = mapper.build_target(
+        _file(shortcut_target_id="target-9"),
+        "/",
+        EXTENSIONS,
+        "",
+        content_mode=mapper.CONTENT_MODE_PATH,
+        path_prefix="/home/googleDevice",
+    )
+    assert target is not None
+    assert target.url == "/home/googleDevice/A/B/C/D/a.mkv"
+
+
+def test_build_target_path_mode_rejects_unsafe_path() -> None:
+    """路径模式仍拒绝越界相对路径。"""
+    assert (
+        mapper.build_target(
+            _file(path="/A/../a.mkv"),
+            "/",
+            EXTENSIONS,
+            "",
+            content_mode=mapper.CONTENT_MODE_PATH,
+            path_prefix="/home/googleDevice",
+        )
+        is None
+    )
+
+
+def test_build_targets_path_mode() -> None:
+    """build_targets 透传内容模式与前缀。"""
+    targets = mapper.build_targets(
+        [_file()],
+        "/",
+        EXTENSIONS,
+        "",
+        content_mode=mapper.CONTENT_MODE_PATH,
+        path_prefix="/home/googleDevice",
+    )
+    assert targets["A/B/C/D/a.strm"].url == "/home/googleDevice/A/B/C/D/a.mkv"

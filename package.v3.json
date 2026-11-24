@@ -71,14 +71,15 @@
   },
   "GDriveStrm": {
     "name": "谷歌 STRM 管理",
-    "description": "读取 Google Drive 目录树，把视频文件按原目录结构映射为本地 .strm，内容为 Drive 文件直链；支持目录树变化事件秒级增量、定时对账和手动全量同步，失效 STRM 可自动清理。",
+    "description": "读取 Google Drive 目录树，把视频文件按原目录结构映射为本地 .strm，内容可写 Drive 文件直链或带前缀的本地挂载路径；支持目录树变化事件秒级增量、定时对账和手动全量同步，失效 STRM 可自动清理。",
     "labels": "网盘",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "icon": "cloudstrm.png",
     "author": "yating1022",
     "level": 1,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.2": "新增「STRM 内容模式」与「本地路径前缀」：可选择写入 Google Drive 直链或本地挂载路径，例如前缀 /home/googleDevice + 相对路径 A/B/C/a.mkv 写入 /home/googleDevice/A/B/C/a.mkv；默认仍为直链，切换后下次同步自动重写旧 STRM。",
       "v1.0.1": "增强运行日志：收到目录树事件时输出来源与变更数量；同步开始输出类型与输出目录；新增/更新/删除 STRM 及失败原因逐条输出（带数量上限），便于确认事件联动是否生效。",
       "v1.0.0": "初始版本：复用 GDriveTree 目录树，按树结构生成 STRM、视频后缀白名单、URL 模板、事件增量、定时同步、全量同步、失效清理、记录分页与详情页操作。"
     }

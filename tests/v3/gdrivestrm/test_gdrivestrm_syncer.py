@@ -253,6 +253,69 @@ def test_apply_changes_replacement_at_same_path_keeps_new_file(
     assert records["A/a.strm"].source_file_id == "new"
 
 
+def test_apply_changes_writes_local_path_content(tmp_path: Path) -> None:
+    """路径模式下事件增量写入前缀加相对路径。"""
+    root = tmp_path / "out"
+    syncer = syncer_module.StrmSyncer(root, cleanup=True)
+    records: Dict[str, Any] = {}
+    outcome = syncer.apply_changes(
+        added=[
+            {
+                "file_id": "new",
+                "name": "a.mkv",
+                "path": "/A/B/a.mkv",
+                "is_dir": False,
+            }
+        ],
+        updated=[],
+        removed=[],
+        root_path="/",
+        extensions=EXTENSIONS,
+        url_template=URL,
+        records=records,
+        content_mode=mapper.CONTENT_MODE_PATH,
+        path_prefix="/home/googleDevice",
+    )
+    assert [item.url for item in outcome.added] == [
+        "/home/googleDevice/A/B/a.mkv"
+    ]
+    written = root / "A" / "B" / "a.strm"
+    assert written.read_text(encoding="utf-8") == "/home/googleDevice/A/B/a.mkv"
+
+
+def test_apply_changes_path_mode_rewrites_old_url_content(tmp_path: Path) -> None:
+    """从直链切换到路径模式后，同一文件的内容被重写。"""
+    root = tmp_path / "out"
+    syncer = syncer_module.StrmSyncer(root, cleanup=True)
+    old = _record("A/a.strm", file_id="f1", source_path="/A/a.mkv")
+    (root / "A").mkdir(parents=True)
+    (root / "A" / "a.strm").write_text(old.url, encoding="utf-8")
+    records = {old.rel_path: old}
+    outcome = syncer.apply_changes(
+        added=[],
+        updated=[
+            {
+                "file_id": "f1",
+                "name": "a.mkv",
+                "path": "/A/a.mkv",
+                "is_dir": False,
+            }
+        ],
+        removed=[],
+        root_path="/",
+        extensions=EXTENSIONS,
+        url_template=URL,
+        records=records,
+        content_mode=mapper.CONTENT_MODE_PATH,
+        path_prefix="/home/googleDevice",
+    )
+    assert [item.url for item in outcome.updated] == [
+        "/home/googleDevice/A/a.mkv"
+    ]
+    written = (root / "A" / "a.strm").read_text(encoding="utf-8")
+    assert written == "/home/googleDevice/A/a.mkv"
+
+
 def test_stop_event_cancels_before_write(tmp_path: Path) -> None:
     """停止信号置位后不再写入。"""
     event = threading.Event()

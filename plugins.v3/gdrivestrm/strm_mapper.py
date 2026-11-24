@@ -15,6 +15,12 @@ DEFAULT_URL_TEMPLATE = (
 )
 URL_PLACEHOLDER = "{fileId}"
 
+# STRM 内容模式：Google Drive 直链，或本地挂载路径
+CONTENT_MODE_URL = "url"
+CONTENT_MODE_PATH = "path"
+DEFAULT_CONTENT_MODE = CONTENT_MODE_URL
+DEFAULT_PATH_PREFIX = ""
+
 DEFAULT_VIDEO_EXTENSIONS = (
     "mkv mp4 avi ts m2ts mts iso rmvb wmv mov flv webm mpg mpeg m4v vob "
     "3gp f4v asf divx ogm ogv tp trp m2v mxf"
@@ -38,7 +44,11 @@ class TreeFile:
 
 @dataclass(frozen=True, slots=True)
 class StrmTarget:
-    """一个待写出的 STRM 目标。"""
+    """一个待写出的 STRM 目标。
+
+    ``url`` 保存最终写入 ``.strm`` 的内容：URL 模式下是 Drive 直链，
+    路径模式下是本地挂载路径；字段名沿用 ``url`` 以兼容数据库列。
+    """
 
     rel_path: str
     source_file_id: str
@@ -177,11 +187,36 @@ def render_url(template: Any, file_id: Any) -> Optional[str]:
     return pattern.replace(URL_PLACEHOLDER, identifier)
 
 
+def join_path_prefix(prefix: Any, relative: Any) -> str:
+    """
+    把路径前缀与相对路径拼成 STRM 内容。
+
+    - 反斜杠统一为 POSIX 斜杠，合并重复斜杠，去掉前缀末尾斜杠；
+    - 空前缀（或仅 ``/``）等价于根目录，结果以 ``/`` 开头；
+    - 非空前缀原样保留（允许 ``D:/Media`` 这类挂载点），不强制补前导斜杠。
+
+    :param prefix: 用户配置的本地路径前缀
+    :param relative: 去掉目录树根后的相对路径，例如 ``A/B/C/a.mkv``
+    :return: 拼接后的内容路径
+    """
+    text = str(prefix or "").strip().replace("\\", "/")
+    while "//" in text:
+        text = text.replace("//", "/")
+    text = text.rstrip("/")
+    rel = str(relative or "").strip().lstrip("/")
+    if not text:
+        return "/" + rel
+    return f"{text}/{rel}"
+
+
 def build_target(
     tree_file: TreeFile,
     root_path: Any,
     extensions: FrozenSet[str],
     url_template: str,
+    *,
+    content_mode: str = DEFAULT_CONTENT_MODE,
+    path_prefix: str = DEFAULT_PATH_PREFIX,
 ) -> Optional[StrmTarget]:
     """
     把一个树文件映射为 STRM 目标。
@@ -189,23 +224,30 @@ def build_target(
     :param tree_file: 目录树文件节点
     :param root_path: 目录树根路径
     :param extensions: 视频后缀集合
-    :param url_template: URL 模板
-    :return: 目标；不匹配、路径非法或 ID 为空时返回 None
+    :param url_template: URL 模式下的内容模板
+    :param content_mode: ``url`` 写直链；``path`` 写本地路径
+    :param path_prefix: 路径模式下的本地挂载前缀
+    :return: 目标；不匹配、路径非法或内容无法生成时返回 None
     """
     if not is_video_name(tree_file.name or tree_file.path, extensions):
         return None
     relative = strip_root_path(tree_file.path, root_path)
     if not relative or not is_safe_rel_path(relative):
         return None
-    identifier = str(tree_file.shortcut_target_id or tree_file.file_id or "").strip()
-    url = render_url(url_template, identifier)
-    if not url:
+    if content_mode == CONTENT_MODE_PATH:
+        content: Optional[str] = join_path_prefix(path_prefix, relative)
+    else:
+        identifier = str(
+            tree_file.shortcut_target_id or tree_file.file_id or ""
+        ).strip()
+        content = render_url(url_template, identifier)
+    if not content:
         return None
     return StrmTarget(
         rel_path=relative.rsplit(".", 1)[0] + ".strm",
         source_file_id=str(tree_file.file_id or "").strip(),
         source_path=str(tree_file.path or ""),
-        url=url,
+        url=content,
         size=int(tree_file.size or 0),
         modified_time=float(tree_file.modified_time or 0.0),
     )
@@ -216,6 +258,9 @@ def build_targets(
     root_path: Any,
     extensions: FrozenSet[str],
     url_template: str,
+    *,
+    content_mode: str = DEFAULT_CONTENT_MODE,
+    path_prefix: str = DEFAULT_PATH_PREFIX,
 ) -> Dict[str, StrmTarget]:
     """
     构建 rel_path → 目标 的映射。
@@ -223,12 +268,21 @@ def build_targets(
     :param files: 目录树文件节点
     :param root_path: 目录树根路径
     :param extensions: 视频后缀集合
-    :param url_template: URL 模板
+    :param url_template: URL 模式下的内容模板
+    :param content_mode: ``url`` 写直链；``path`` 写本地路径
+    :param path_prefix: 路径模式下的本地挂载前缀
     :return: 以相对 STRM 路径为键的目标字典
     """
     targets: Dict[str, StrmTarget] = {}
     for tree_file in files:
-        target = build_target(tree_file, root_path, extensions, url_template)
+        target = build_target(
+            tree_file,
+            root_path,
+            extensions,
+            url_template,
+            content_mode=content_mode,
+            path_prefix=path_prefix,
+        )
         if target is not None:
             targets[target.rel_path] = target
     return targets

@@ -295,6 +295,60 @@ def test_full_sync_maps_tree_to_strm(tmp_path: Path, plugin_module: Any) -> None
     assert meta["target_count"] == 1
 
 
+def test_full_sync_writes_local_path_content(
+    tmp_path: Path, plugin_module: Any
+) -> None:
+    """路径模式：内容为前缀加相对目录树根的路径。"""
+    instance = _new_plugin(
+        plugin_module,
+        tmp_path / "out",
+        content_mode="path",
+        path_prefix="/home/googleDevice",
+    )
+    _seed_tree(
+        instance._databases["GDriveTree"], [_video("f1", "/A/B/C/a.mkv")]
+    )
+    _run(instance, {"kind": "full"}, plugin_module)
+    written = tmp_path / "out" / "A" / "B" / "C" / "a.strm"
+    assert written.read_text(encoding="utf-8") == (
+        "/home/googleDevice/A/B/C/a.mkv"
+    )
+    assert instance._load_meta()["status"] == "success"
+
+
+def test_path_mode_requires_prefix(tmp_path: Path, plugin_module: Any) -> None:
+    """路径模式未配置前缀时中止同步，不写文件。"""
+    instance = _new_plugin(
+        plugin_module,
+        tmp_path / "out",
+        content_mode="path",
+        path_prefix="",
+    )
+    _seed_tree(instance._databases["GDriveTree"], [_video("f1", "/A/a.mkv")])
+    _run(instance, {"kind": "full"}, plugin_module)
+    meta = instance._load_meta()
+    assert meta["status"] == "failed"
+    assert "路径前缀" in meta["error"]
+    assert not (tmp_path / "out" / "A" / "a.strm").exists()
+
+
+def test_switch_to_path_mode_rewrites_url_content(
+    tmp_path: Path, plugin_module: Any
+) -> None:
+    """从直链切换到路径模式后，旧 STRM 内容被重写。"""
+    instance = _new_plugin(plugin_module, tmp_path / "out")
+    _seed_tree(instance._databases["GDriveTree"], [_video("f1", "/A/a.mkv")])
+    _run(instance, {"kind": "full"}, plugin_module)
+    written = tmp_path / "out" / "A" / "a.strm"
+    assert written.read_text(encoding="utf-8").startswith("https://")
+
+    instance._content_mode = "path"
+    instance._path_prefix = "/home/googleDevice"
+    _run(instance, {"kind": "diff"}, plugin_module)
+    assert written.read_text(encoding="utf-8") == "/home/googleDevice/A/a.mkv"
+    assert instance._load_meta()["status"] == "success"
+
+
 def test_full_sync_is_idempotent(tmp_path: Path, plugin_module: Any) -> None:
     """重复全量同步不改变已一致文件的 mtime。"""
     instance = _new_plugin(plugin_module, tmp_path / "out")
