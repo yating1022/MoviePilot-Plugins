@@ -79,3 +79,38 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: GDriveStorage 配置同步：定时/手动推送与接收端接口文档
+
+**Date**: 2026-11-24
+**Task**: GDriveStorage 配置同步：定时/手动推送与接收端接口文档
+**Branch**: `feat/gdrive-config-sync`
+
+### Summary
+
+为 GDriveStorage 增加配置同步：5 个配置项、GDriveStorageSync 定时服务、/sync/push 手动 API、四字段 JSON 推送、2xx 判定、非阻塞锁与状态持久化；输出 docs/gdrive-config-sync-api.md 供接收端实现；新增 plugin-v3 主动推送规范。版本 1.1.4，插件测试 69、全仓 189 通过。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `0db5f3e` | (see git log) |
+| `da9d20d` | (see git log) |
+| `349da74` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
