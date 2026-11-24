@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/plugin-v3/index.md", "reason": "最终检查插件规范符合度"}
+{"file": ".trellis/spec/plugin-v3/cross-plugin-events.md", "reason": "检查定向事件载荷与消费方过滤/合并"}
+{"file": ".trellis/spec/plugin-v3/page-api-envelope.md", "reason": "检查三键 envelope、页面按钮刷新与 VAlert 布局"}
+{"file": ".trellis/spec/plugin-v3/plugin-database-and-config-sharing.md", "reason": "检查插件自有表、后台线程锁、失败保留旧数据"}
+{"file": ".trellis/tasks/11-23-gdrive-strm/research/host-plugin-events-and-db.md", "reason": "核对事件定向字段与跨插件数据库读取方式"}
+{"file": ".trellis/tasks/11-23-gdrive-strm/prd.md", "reason": "逐条核对验收标准"}
+{"file": ".trellis/tasks/11-23-gdrive-strm/design.md", "reason": "核对实现与设计一致（路径映射、清理策略、事件契约）"}
