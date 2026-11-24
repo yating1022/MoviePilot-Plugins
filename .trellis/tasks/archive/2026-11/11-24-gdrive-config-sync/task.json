@@ -1,0 +1,29 @@
+{
+  "id": "gdrive-config-sync",
+  "name": "gdrive-config-sync",
+  "title": "Google Drive 存储配置同步",
+  "description": "GDriveStorage 定时/手动向可配置接口推送 OAuth 凭据，并输出接收端接口文档",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "fruits",
+  "assignee": "fruits",
+  "createdAt": "2026-11-24",
+  "completedAt": "2026-11-24",
+  "branch": "feat/gdrive-config-sync",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "11-24-gdrive-config-sync-impl",
+    "11-24-gdrive-config-sync-api-doc"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

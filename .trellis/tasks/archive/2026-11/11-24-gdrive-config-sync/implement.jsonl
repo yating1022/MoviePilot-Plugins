@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/11-24-gdrive-config-sync/prd.md", "reason": "父任务需求、决策与跨子任务验收"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync/design.md", "reason": "请求契约唯一事实源与集成设计"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync/research/gdrive-storage-sync-code-map.md", "reason": "GDriveStorage 集成点与现有调度/HTTP/测试模式"}
+{"file": ".trellis/spec/plugin-v3/index.md", "reason": "V3 插件规范入口"}
+{"file": ".trellis/spec/plugin-v3/page-api-envelope.md", "reason": "页面按钮 API 三键 envelope 与布局约束"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层边界与依赖方向检查"}
