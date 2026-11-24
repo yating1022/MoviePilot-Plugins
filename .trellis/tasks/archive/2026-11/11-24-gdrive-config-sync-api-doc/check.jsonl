@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/11-24-gdrive-config-sync/design.md", "reason": "逐项核对文档与请求契约一致"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync-api-doc/prd.md", "reason": "逐条核对文档验收标准"}
+{"file": ".trellis/tasks/11-24-gdrive-config-sync-api-doc/implement.md", "reason": "核对文档章节与字段拼写检查项"}
