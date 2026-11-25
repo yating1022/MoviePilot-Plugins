@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
-- **Last Active**: 2026-11-24
+- **Total Sessions**: 5
+- **Last Active**: 2026-11-25
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~149 | Active |
+| `journal-1.md` | ~185 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 5 | 2026-11-25 | GDriveStrm 本地路径内容与 GDriveTree 归档名称容错 | `9a4d752`, `80064ff`, `b6532e2`, `f1f36d6` | `main` |
 | 4 | 2026-11-24 | 收尾：修正根 README 版本并合入 main | `3129a68` | `main` |
 | 3 | 2026-11-24 | GDriveStorage 配置同步：定时/手动推送与接收端接口文档 | `0db5f3e`, `da9d20d`, `349da74` | `feat/gdrive-config-sync` |
 | 2 | 2026-11-24 | Google STRM 管理插件与目录树事件联动 | `66d8329`, `c4c77c1`, `ebf7df5`, `304f378`, `2dd56a6`, `44f5d0f`, `8e0cbd0`, `96e41f0`, `a6a6a6e` | `main` |

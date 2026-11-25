@@ -147,3 +147,39 @@
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: GDriveStrm 本地路径内容与 GDriveTree 归档名称容错
+
+**Date**: 2026-11-25
+**Task**: GDriveStrm 本地路径内容与 GDriveTree 归档名称容错
+**Branch**: `main`
+
+### Summary
+
+GDriveStrm 新增 content_mode/path_prefix 配置，支持写入本地挂载路径并自动重写旧 STRM；GDriveTree 归档入树在精确名称查询失败后改为子项归一化匹配（全角标点、大小写、空白、零宽字符），仅唯一命中采用，歧义时输出候选名；补充两层规范文档与 221 项测试。
+
+### Main Changes
+
+- Detailed change bullets were not supplied; see the summary above.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9a4d752` | (see git log) |
+| `80064ff` | (see git log) |
+| `b6532e2` | (see git log) |
+| `f1f36d6` | (see git log) |
+
+### Testing
+
+- Validation was not recorded for this session.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
