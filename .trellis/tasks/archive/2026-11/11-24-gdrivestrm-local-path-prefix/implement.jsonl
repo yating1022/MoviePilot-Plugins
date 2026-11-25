@@ -1,0 +1,4 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/plugin-v3/page-api-envelope.md", "reason": "配置表单、插件版本与详情页契约"}
+{"file": ".trellis/spec/plugin-v3/plugin-database-and-config-sharing.md", "reason": "插件自有表、配置归一化与后台线程"}
+{"file": ".trellis/spec/plugin-v3/cross-plugin-events.md", "reason": "目录树变更事件与增量同步语义"}
