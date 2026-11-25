@@ -13,3 +13,4 @@
 | [Cross-plugin Events](./cross-plugin-events.md) | `EventType.PluginTriggered` 定向事件、载荷上限与 `tree.changed` 契约 |
 | [Outbound Config Sync](./outbound-config-sync.md) | 向用户指定接口主动推送凭据/配置：定时+手动、非阻塞锁、四字段契约、2xx 判定与凭据安全 |
 | [STRM Content Modes](./strm-content-modes.md) | `.strm` 内容模式（直链/本地路径）、路径前缀拼接契约、空前缀校验与切换重写语义 |
+| [Archive Name Matching](./archive-name-matching.md) | 归档路径映射回目录树时的名称等价匹配：归一化层级、唯一命中、歧义拒绝与候选名错误输出 |
