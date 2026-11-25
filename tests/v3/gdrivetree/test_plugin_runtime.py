@@ -565,6 +565,7 @@ class _FakeArchiveClient:
     """归档测试用客户端替身。"""
 
     files: Dict[str, Dict[str, Any]] = {}
+    list_calls: int = 0
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -580,6 +581,14 @@ class _FakeArchiveClient:
             if meta.get("name") == name and parent_id in (meta.get("parents") or []):
                 return dict(meta)
         return None
+
+    def list_children(self, parent_id: str) -> List[Dict[str, Any]]:
+        _FakeArchiveClient.list_calls += 1
+        return [
+            dict(meta)
+            for meta in _FakeArchiveClient.files.values()
+            if parent_id in (meta.get("parents") or [])
+        ]
 
     def close(self) -> None:
         pass
@@ -749,6 +758,207 @@ def test_archive_event_creates_missing_parent_dirs(
     assert rows["f-new"].path == "/workspace/媒体库/电视剧/Season 1/a.mkv"
     assert rows["f-new"].parent_file_id == "s1"
     assert link is not None and link.status == "done"
+
+
+def test_archive_event_matches_full_width_name(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """归档路径与云端名称存在全角/半角差异时，容错匹配并入树。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+    ]
+    _save_files(plugin_module, instance, seed)
+    cloud_name = "明天，美食广场见。.2025.S01E02.第2集.mkv"
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "tv": {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+        "f-full": {
+            "id": "f-full",
+            "name": cloud_name,
+            "mimeType": "video/x-matroska",
+            "parents": ["tv"],
+            "size": "10",
+        },
+    }
+    _FakeArchiveClient.list_calls = 0
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target(
+        "", f"/电视剧/{cloud_name.replace('，', ',').replace('。', '.')}", 45
+    )
+    with instance._session() as session:
+        row = session.scalar(
+            select(plugin_module.TreeNode).where(
+                plugin_module.TreeNode.file_id == "f-full"
+            )
+        )
+    assert row is not None
+    assert row.name == cloud_name  # 以云端真实名称为准
+    assert _FakeArchiveClient.list_calls > 0
+
+
+def test_archive_event_exact_match_skips_listing(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """精确命中时不触发列举子项。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+    ]
+    _save_files(plugin_module, instance, seed)
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "tv": {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+        "f1": {
+            "id": "f1",
+            "name": "a.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["tv"],
+            "size": "10",
+        },
+    }
+    _FakeArchiveClient.list_calls = 0
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target("", "/电视剧/a.mkv", 46)
+    with instance._session() as session:
+        row = session.scalar(
+            select(plugin_module.TreeNode).where(
+                plugin_module.TreeNode.file_id == "f1"
+            )
+        )
+    assert row is not None
+    assert _FakeArchiveClient.list_calls == 0
+
+
+def test_archive_event_ambiguous_name_records_failure(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """同层多个候选时不猜，记录 failed。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+    ]
+    _save_files(plugin_module, instance, seed)
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "tv": {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+        "f-a": {
+            "id": "f-a",
+            "name": "Show。S01.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["tv"],
+        },
+        "f-b": {
+            "id": "f-b",
+            "name": "Show.S01.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["tv"],
+        },
+    }
+    _FakeArchiveClient.list_calls = 0
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    plugin_module.logger.messages.clear()
+    instance._handle_event_target("", "/电视剧/show.s01.mkv", 47)
+    with instance._session() as session:
+        link = session.scalar(
+            select(plugin_module.ArchiveLink).where(
+                plugin_module.ArchiveLink.history_id == 47
+            )
+        )
+    assert link is not None and link.status == "failed"
+    assert "歧义" in (link.error or "")
+    assert "Show。S01.mkv" in (link.error or "")
+    assert "Show.S01.mkv" in (link.error or "")
+    logs = "\n".join(plugin_module.logger.messages)
+    assert "歧义" in logs
+
+
+def test_archive_event_reports_candidates_when_name_missing(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """匹配不到时错误信息带上该目录的候选名，便于判断差异类型。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+    ]
+    _save_files(plugin_module, instance, seed)
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "tv": {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+        "f-other": {
+            "id": "f-other",
+            "name": "unrelated.mkv",
+            "mimeType": "video/x-matroska",
+            "parents": ["tv"],
+        },
+    }
+    _FakeArchiveClient.list_calls = 0
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target("", "/电视剧/missing.mkv", 48)
+    with instance._session() as session:
+        link = session.scalar(
+            select(plugin_module.ArchiveLink).where(
+                plugin_module.ArchiveLink.history_id == 48
+            )
+        )
+    assert link is not None and link.status == "failed"
+    assert "候选" in (link.error or "")
+    assert "unrelated.mkv" in (link.error or "")
+
+
+def test_archive_event_matches_space_difference(
+    plugin_module: Any, monkeypatch: Any
+) -> None:
+    """仅空白差异的名称通过去空白层级匹配并入树，写入云端名称。"""
+    instance = _new_plugin(plugin_module)
+    seed = [
+        {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+    ]
+    _save_files(plugin_module, instance, seed)
+    cloud_name = "Show S01E01.mkv"
+    _FakeArchiveClient.files = {
+        "root": {"id": "root", "name": "Root", "mimeType": FOLDER, "parents": []},
+        "tv": {"id": "tv", "name": "电视剧", "mimeType": FOLDER, "parents": ["root"]},
+        "f-space": {
+            "id": "f-space",
+            "name": cloud_name,
+            "mimeType": "video/x-matroska",
+            "parents": ["tv"],
+            "size": "10",
+        },
+    }
+    _FakeArchiveClient.list_calls = 0
+    _FakeArchiveClient.root_info = plugin_module.RootInfo(
+        file_id="root", name="Root", drive_id="", corpora="allDrives"
+    )
+    monkeypatch.setattr(plugin_module, "GDriveTreeClient", _FakeArchiveClient)
+    instance._handle_event_target("", "/电视剧/ShowS01E01.mkv", 49)
+    with instance._session() as session:
+        row = session.scalar(
+            select(plugin_module.TreeNode).where(
+                plugin_module.TreeNode.file_id == "f-space"
+            )
+        )
+    assert row is not None
+    assert row.name == cloud_name
+    assert _FakeArchiveClient.list_calls > 0
 
 
 def test_archive_target_paths_prefers_dest_file(plugin_module: Any) -> None:

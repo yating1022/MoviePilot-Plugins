@@ -371,6 +371,59 @@ def test_find_child_by_name() -> None:
     assert "name = 'a.mkv'" in params["q"]
 
 
+def test_list_children_queries_by_parent_only() -> None:
+    """列举子项只按父目录过滤，不按名称过滤。"""
+    transport = FakeTransport([
+        _token(),
+        FakeResponse(payload={"files": [{"id": "f1", "name": "a.mkv"}]}),
+    ])
+    files = _make_client(transport).list_children("parent-1")
+    assert [item["id"] for item in files] == ["f1"]
+    params = transport.calls[1]["params"]
+    assert "'parent-1' in parents" in params["q"]
+    assert "name =" not in params["q"]
+    assert params["corpora"] == "allDrives"
+    assert params["pageSize"] == 1000
+    assert params["supportsAllDrives"] == "true"
+    assert params["includeItemsFromAllDrives"] == "true"
+    assert "files(" in params["fields"]
+    assert "nextPageToken" in params["fields"]
+
+
+def test_list_children_stops_after_max_pages() -> None:
+    """超过最大页数时中止，避免异常目录拖慢归档。"""
+    transport = FakeTransport([
+        _token(),
+        FakeResponse(payload={"files": [], "nextPageToken": "t2"}),
+        FakeResponse(payload={"files": [], "nextPageToken": "t3"}),
+    ])
+    with pytest.raises(GDriveTreeError):
+        _make_client(transport).list_children("parent-1", max_pages=2)
+
+
+def test_list_children_follows_page_token() -> None:
+    """分页令牌存在时继续列举。"""
+    transport = FakeTransport([
+        _token(),
+        FakeResponse(payload={"files": [{"id": "f1", "name": "a"}], "nextPageToken": "t2"}),
+        FakeResponse(payload={"files": [{"id": "f2", "name": "b"}]}),
+    ])
+    files = _make_client(transport).list_children("parent-1")
+    assert [item["id"] for item in files] == ["f1", "f2"]
+    assert transport.calls[2]["params"]["pageToken"] == "t2"
+
+
+def test_list_children_rejects_page_loop() -> None:
+    """分页令牌重复时中止，避免死循环。"""
+    transport = FakeTransport([
+        _token(),
+        FakeResponse(payload={"files": [], "nextPageToken": "t2"}),
+        FakeResponse(payload={"files": [], "nextPageToken": "t2"}),
+    ])
+    with pytest.raises(GDriveTreeError):
+        _make_client(transport).list_children("parent-1")
+
+
 def test_close_closes_transport() -> None:
     """close 传递到传输层。"""
     transport = FakeTransport([])

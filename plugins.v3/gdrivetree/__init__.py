@@ -28,6 +28,7 @@ from app.sdk.plugin import _PluginBase
 from .archive_source import ArchiveRecord, ArchiveSource
 from .errors import GDriveTreeAuthError, GDriveTreeCancelled, GDriveTreeError
 from .gdrive_tree_client import FILE_FIELDS, GDriveTreeClient, RootInfo
+from .name_match import candidate_names, match_child
 from .tree_builder import (
     FOLDER_MIME,
     SHORTCUT_MIME,
@@ -238,7 +239,7 @@ class GDriveTree(_PluginBase):
         "复用 Google Drive 存储插件的授权配置，一次性拉取文件元数据并在本地建树，"
         "把指定根目录的目录树持久化到插件自有数据库，支持手动和定时刷新。"
     )
-    plugin_version = "1.2.5"
+    plugin_version = "1.2.6"
     plugin_label = "网盘"
     plugin_author = "yating1022"
     plugin_config_prefix = "gdrivetree_"
@@ -1110,14 +1111,68 @@ class GDriveTree(_PluginBase):
                 raise GDriveTreeError(
                     f"父目录不在目录树中：{parent_path}；请先刷新目录树"
                 )
-            meta = client.find_child(
-                parent.shortcut_target_id or parent.file_id, name
-            )
+            meta, detail = self._find_child_meta(client, parent, name)
             if meta is None:
-                raise GDriveTreeError(f"云端未找到目标文件：{path}")
+                raise GDriveTreeError(f"云端未找到目标文件：{path}{detail}")
         if not meta:
             raise GDriveTreeError("缺少目标文件 ID 或路径")
         return self._nodes_from_metadata(client, meta, root, source)
+
+    def _find_child_meta(
+        self, client: GDriveTreeClient, anchor: Any, name: str
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """
+        按名称查找目录子项，精确查询失败时回退为归一化比较。
+
+        归档历史与云端可能在全角/半角、大小写、空白或零宽字符上存在差异，
+        ``files.list`` 的 ``name =`` 是字符级精确匹配，因此这里在未命中时取回
+        子项做等价匹配。只有唯一命中才采用，出现歧义按未找到处理，避免误配。
+
+        :param client: Drive 客户端
+        :param anchor: 父目录树节点（使用 ``shortcut_target_id`` 优先）
+        :param name: 归档路径中的名称
+        :return: ``(云端元数据, 未命中说明)``；唯一命中时元数据非空、说明为空串，
+            未命中时元数据为 None，说明可直接拼在调用方的错误信息后
+            （候选名或列举失败原因），没有可补充的信息时为空串
+        """
+        parent_id = str(
+            getattr(anchor, "shortcut_target_id", "") or anchor.file_id
+        )
+        meta = client.find_child(parent_id, name)
+        if meta is not None:
+            return meta, ""
+        try:
+            candidates = client.list_children(parent_id)
+        except GDriveTreeCancelled:
+            raise
+        except GDriveTreeError as err:
+            logger.debug(
+                f"【GDriveTree】列举子项失败（{parent_id}）：{err}", exc_info=True
+            )
+            return None, f"（列举子项失败：{err}）"
+        match = match_child(candidates, name)
+        if match.item is not None:
+            matched_name = str(match.item.get("name") or "")
+            logger.info(
+                f"【GDriveTree】名称容错匹配（层级 {match.level}）："
+                f"{name} -> {matched_name}"
+            )
+            return match.item, ""
+        if match.ambiguous:
+            names = "、".join(match.ambiguous[:5])
+            logger.warning(
+                f"【GDriveTree】名称匹配存在歧义，未采用：{name} 命中 {names}"
+            )
+            return None, f"；名称匹配存在歧义，候选：{names}"
+        available = candidate_names(candidates, limit=5)
+        if available:
+            names = "、".join(available)
+            logger.info(
+                f"【GDriveTree】名称未匹配：{name}；"
+                f"目录 {parent_id} 候选：{names}"
+            )
+            return None, f"；候选：{names}"
+        return None, ""
 
     def _resolve_archive_nodes(
         self,
@@ -1181,13 +1236,10 @@ class GDriveTree(_PluginBase):
                     raise GDriveTreeError(f"路径段不是目录：{existing.path}")
                 anchor = existing
                 continue
-            lookup_id = (
-                getattr(anchor, "shortcut_target_id", "") or anchor.file_id
-            )
-            child = client.find_child(lookup_id, segment)
+            child, detail = self._find_child_meta(client, anchor, segment)
             if child is None:
                 raise GDriveTreeError(
-                    f"云端未找到路径段：{anchor.path}{segment}"
+                    f"云端未找到路径段：{anchor.path}{segment}{detail}"
                 )
             node = self._node_from_child_meta(anchor, child, segment)
             if not is_last and not node.is_dir:

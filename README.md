@@ -53,7 +53,7 @@ MoviePilot 三方插件仓库（仅支持 V3）：https://github.com/yating1022/
 | 项目 | 值 |
 | --- | --- |
 | 插件 ID | `GDriveTree` |
-| 版本 | 1.2.5 |
+| 版本 | 1.2.6 |
 | 标签 | 网盘 |
 | 系统要求 | MoviePilot >= 3.0.0 |
 
@@ -61,7 +61,7 @@ MoviePilot 三方插件仓库（仅支持 V3）：https://github.com/yating1022/
 
 读取 Google Drive 目录树，把视频文件按原父子结构映射为本地 `.strm`。
 
-- `.strm` 内容为 Google Drive 文件直链，文件快捷方式使用目标文件 ID。
+- `.strm` 内容可写 Google Drive 直链或带前缀的本地挂载路径，文件快捷方式在直链模式使用目标文件 ID。
 - 支持目录树事件秒级增量、定时对账、手动全量同步。
 - 默认只创建视频所在目录链；失效 STRM 只清理本插件记录过的文件。
 - 幂等写入，内容一致不改变文件修改时间。

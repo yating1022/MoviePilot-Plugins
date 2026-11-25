@@ -357,6 +357,68 @@ class GDriveTreeClient:
         """转义 Drive 查询字符串中的反斜杠和单引号。"""
         return str(value).replace("\\", "\\\\").replace("'", "\\'")
 
+    def list_children(
+        self,
+        parent_id: str,
+        *,
+        max_pages: int = 5,
+        stop_event: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        列出目录直接子项，用于名称容错匹配。
+
+        只按父目录过滤，不按名称过滤；归档路径中的名字与云端名称存在全角/半角、
+        空白等差异时，先取回子项再在本地做归一化比较。
+
+        :param parent_id: 父目录 ID
+        :param max_pages: 最大分页数，防止异常目录拖慢归档
+        :param stop_event: 可选 ``threading.Event``，置位后中止
+        :return: 子项元数据列表
+        :raises GDriveTreeError: 父目录 ID 为空、分页超限或请求失败
+        """
+        identifier = str(parent_id or "").strip()
+        if not identifier:
+            raise GDriveTreeError("列举子项时父目录 ID 为空")
+        query = (
+            f"'{self._escape_query(identifier)}' in parents "
+            "and trashed = false"
+        )
+        files: List[Dict[str, Any]] = []
+        page_token = ""
+        seen_tokens: set[str] = set()
+        for _ in range(max(1, int(max_pages or 1))):
+            if stop_event is not None and stop_event.is_set():
+                raise GDriveTreeCancelled("列举子项已被主动中止")
+            params: Dict[str, Any] = {
+                "q": query,
+                "fields": f"nextPageToken,files({FILE_FIELDS})",
+                "pageSize": 1000,
+                "supportsAllDrives": "true",
+                "includeItemsFromAllDrives": "true",
+                "corpora": "allDrives",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            data = self._json(
+                self._request(
+                    "GET", f"{DRIVE_API}/files", params=params,
+                    stop_event=stop_event,
+                )
+            )
+            for raw in data.get("files") or []:
+                if isinstance(raw, dict):
+                    files.append(raw)
+            next_token = str(data.get("nextPageToken") or "")
+            if not next_token:
+                return files
+            if next_token in seen_tokens:
+                raise GDriveTreeError("Google Drive 分页令牌重复，已中止列举子项")
+            seen_tokens.add(next_token)
+            page_token = next_token
+        raise GDriveTreeError(
+            f"目录 {identifier} 子项超过 {max_pages} 页，已中止列举"
+        )
+
     def close(self) -> None:
         """关闭传输层。"""
         try:
